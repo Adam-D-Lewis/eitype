@@ -1,0 +1,645 @@
+//! eitype - A wtype-like CLI tool for typing text using Emulated Input (EI) on Wayland
+//!
+//! This tool connects to an EI server (either directly via socket or through the XDG portal)
+//! and emulates keyboard input to type text.
+
+use anyhow::{anyhow, bail, Context as AnyhowContext, Result};
+use clap::Parser;
+use log::{debug, error, info, trace, warn};
+use reis::ei::{self, handshake::ContextType, keyboard::KeyState};
+use reis::event::{DeviceCapability, EiEvent};
+use std::collections::HashMap;
+use std::os::unix::net::UnixStream;
+use std::time::{Duration, Instant};
+use xkbcommon::xkb;
+
+/// A wtype-like tool for typing text using Emulated Input (EI) protocol
+#[derive(Parser, Debug)]
+#[command(name = "eitype", version, about, long_about = None)]
+struct Args {
+    /// Text to type (can be specified multiple times)
+    #[arg(value_name = "TEXT")]
+    text: Vec<String>,
+
+    /// Delay between key events in milliseconds
+    #[arg(short = 'd', long, default_value = "0", value_name = "MS")]
+    delay: u64,
+
+    /// Press a special key (e.g., return, tab, escape, backspace)
+    #[arg(short = 'k', long = "key", value_name = "KEY")]
+    keys: Vec<String>,
+
+    /// Hold a modifier key (e.g., shift, ctrl, alt, super)
+    #[arg(short = 'M', long = "mod", value_name = "MOD")]
+    modifiers: Vec<String>,
+
+    /// Press and release a modifier key
+    #[arg(short = 'P', long = "press-mod", value_name = "MOD")]
+    press_modifiers: Vec<String>,
+
+    /// Use XDG RemoteDesktop portal for connection
+    #[arg(short = 'p', long)]
+    portal: bool,
+
+    /// Socket path (defaults to LIBEI_SOCKET environment variable)
+    #[arg(short = 's', long, value_name = "PATH")]
+    socket: Option<String>,
+
+    /// Verbose output
+    #[arg(short = 'v', long, action = clap::ArgAction::Count)]
+    verbose: u8,
+}
+
+/// Actions to perform after connection is established
+#[derive(Debug, Clone)]
+enum Action {
+    Type(String),
+    Key(String),
+    ModifierHold(String),
+    ModifierPress(String),
+}
+
+/// Build a map of key names to keycodes (evdev codes)
+fn build_key_to_keycode_map() -> HashMap<String, u32> {
+    let mut map = HashMap::new();
+
+    // Modifiers
+    map.insert("shift".to_string(), 42);      // KEY_LEFTSHIFT
+    map.insert("lshift".to_string(), 42);     // KEY_LEFTSHIFT
+    map.insert("rshift".to_string(), 54);     // KEY_RIGHTSHIFT
+    map.insert("ctrl".to_string(), 29);       // KEY_LEFTCTRL
+    map.insert("control".to_string(), 29);    // KEY_LEFTCTRL
+    map.insert("lctrl".to_string(), 29);      // KEY_LEFTCTRL
+    map.insert("rctrl".to_string(), 97);      // KEY_RIGHTCTRL
+    map.insert("alt".to_string(), 56);        // KEY_LEFTALT
+    map.insert("lalt".to_string(), 56);       // KEY_LEFTALT
+    map.insert("ralt".to_string(), 100);      // KEY_RIGHTALT
+    map.insert("altgr".to_string(), 100);     // KEY_RIGHTALT
+    map.insert("super".to_string(), 125);     // KEY_LEFTMETA
+    map.insert("meta".to_string(), 125);      // KEY_LEFTMETA
+    map.insert("win".to_string(), 125);       // KEY_LEFTMETA
+    map.insert("lsuper".to_string(), 125);    // KEY_LEFTMETA
+    map.insert("rsuper".to_string(), 126);    // KEY_RIGHTMETA
+
+    // Special keys
+    map.insert("escape".to_string(), 1);      // KEY_ESC
+    map.insert("esc".to_string(), 1);         // KEY_ESC
+    map.insert("return".to_string(), 28);     // KEY_ENTER
+    map.insert("enter".to_string(), 28);      // KEY_ENTER
+    map.insert("tab".to_string(), 15);        // KEY_TAB
+    map.insert("backspace".to_string(), 14);  // KEY_BACKSPACE
+    map.insert("delete".to_string(), 111);    // KEY_DELETE
+    map.insert("insert".to_string(), 110);    // KEY_INSERT
+    map.insert("home".to_string(), 102);      // KEY_HOME
+    map.insert("end".to_string(), 107);       // KEY_END
+    map.insert("pageup".to_string(), 104);    // KEY_PAGEUP
+    map.insert("pagedown".to_string(), 109);  // KEY_PAGEDOWN
+    map.insert("space".to_string(), 57);      // KEY_SPACE
+    map.insert("capslock".to_string(), 58);   // KEY_CAPSLOCK
+    map.insert("numlock".to_string(), 69);    // KEY_NUMLOCK
+    map.insert("scrolllock".to_string(), 70); // KEY_SCROLLLOCK
+    map.insert("print".to_string(), 99);      // KEY_SYSRQ
+    map.insert("printscreen".to_string(), 99);// KEY_SYSRQ
+    map.insert("pause".to_string(), 119);     // KEY_PAUSE
+    map.insert("menu".to_string(), 127);      // KEY_COMPOSE
+
+    // Arrow keys
+    map.insert("up".to_string(), 103);        // KEY_UP
+    map.insert("down".to_string(), 108);      // KEY_DOWN
+    map.insert("left".to_string(), 105);      // KEY_LEFT
+    map.insert("right".to_string(), 106);     // KEY_RIGHT
+
+    // Function keys
+    for i in 1..=12 {
+        map.insert(format!("f{}", i), 58 + i); // F1=59, F2=60, etc.
+    }
+
+    // Number keys (top row)
+    map.insert("1".to_string(), 2);
+    map.insert("2".to_string(), 3);
+    map.insert("3".to_string(), 4);
+    map.insert("4".to_string(), 5);
+    map.insert("5".to_string(), 6);
+    map.insert("6".to_string(), 7);
+    map.insert("7".to_string(), 8);
+    map.insert("8".to_string(), 9);
+    map.insert("9".to_string(), 10);
+    map.insert("0".to_string(), 11);
+
+    // Letter keys
+    let letters = "abcdefghijklmnopqrstuvwxyz";
+    let letter_codes = [30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47, 17, 45, 21, 44];
+    for (ch, code) in letters.chars().zip(letter_codes.iter()) {
+        map.insert(ch.to_string(), *code);
+    }
+
+    map
+}
+
+/// Find the keycode for a character, and whether shift is needed
+fn find_keycode_for_char(ch: char, keymap: &xkb::Keymap, _xkb_state: &xkb::State) -> Result<(u32, bool)> {
+    let min_keycode: u32 = keymap.min_keycode().into();
+    let max_keycode: u32 = keymap.max_keycode().into();
+
+    // Try each keycode
+    for keycode_raw in min_keycode..=max_keycode {
+        let keycode = xkb::Keycode::new(keycode_raw);
+        // Get number of layouts for this key
+        let num_layouts = keymap.num_layouts_for_key(keycode);
+
+        for layout in 0..num_layouts {
+            let num_levels = keymap.num_levels_for_key(keycode, layout);
+
+            for level in 0..num_levels {
+                let syms = keymap.key_get_syms_by_level(keycode, layout, level);
+
+                for sym in syms {
+                    // Convert keysym to character
+                    let sym_raw: u32 = (*sym).into();
+                    if let Some(sym_char) = keysym_to_char(sym_raw) {
+                        if sym_char == ch {
+                            // Found it! Check if we need shift (level 1 typically means shift)
+                            let need_shift = level == 1;
+                            // Convert from xkb keycode (offset by 8) to evdev keycode
+                            let evdev_keycode = keycode_raw - 8;
+                            return Ok((evdev_keycode, need_shift));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    bail!("Could not find keycode for character: {:?}", ch)
+}
+
+/// Convert an XKB keysym to a character
+fn keysym_to_char(keysym: u32) -> Option<char> {
+    // For ASCII range, keysym often equals the character code
+    if (0x20..=0x7e).contains(&keysym) {
+        return char::from_u32(keysym);
+    }
+
+    // For Latin-1 supplement
+    if (0xa0..=0xff).contains(&keysym) {
+        return char::from_u32(keysym);
+    }
+
+    // Unicode keysyms (0x1000000 + unicode code point)
+    if keysym >= 0x1000000 {
+        return char::from_u32(keysym - 0x1000000);
+    }
+
+    // Special cases
+    match keysym {
+        0xff0d => Some('\n'), // Return
+        0xff09 => Some('\t'), // Tab
+        0x20 => Some(' '),    // Space
+        _ => None,
+    }
+}
+
+/// Get current timestamp in microseconds
+fn get_timestamp() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(Instant::now);
+    start.elapsed().as_micros() as u64
+}
+
+/// Connect to EI via the XDG RemoteDesktop portal
+fn connect_via_portal() -> Result<UnixStream> {
+    use ashpd::desktop::remote_desktop::{DeviceType, RemoteDesktop};
+    use ashpd::desktop::PersistMode;
+    use futures_executor::block_on;
+
+    info!("Connecting via XDG RemoteDesktop portal...");
+
+    block_on(async {
+        let proxy = RemoteDesktop::new().await
+            .context("Failed to create RemoteDesktop proxy")?;
+
+        let session = proxy.create_session().await
+            .context("Failed to create session")?;
+
+        proxy.select_devices(&session, DeviceType::Keyboard.into(), None, PersistMode::DoNot).await
+            .context("Failed to select devices")?;
+
+        let _response = proxy.start(&session, None).await
+            .context("Failed to start session")?;
+
+        let fd = proxy.connect_to_eis(&session).await
+            .context("Failed to connect to EIS")?;
+
+        let stream = UnixStream::from(fd);
+        stream.set_nonblocking(true)
+            .context("Failed to set non-blocking")?;
+
+        Ok(stream)
+    })
+}
+
+/// Connect to EI via socket
+fn connect_via_socket(socket_path: Option<&str>) -> Result<UnixStream> {
+    let path = if let Some(path) = socket_path {
+        std::path::PathBuf::from(path)
+    } else if let Ok(socket) = std::env::var("LIBEI_SOCKET") {
+        let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+            .context("XDG_RUNTIME_DIR not set")?;
+        std::path::Path::new(&runtime_dir).join(socket)
+    } else {
+        bail!("No socket path provided and LIBEI_SOCKET not set. Use -p for portal or -s for socket path.");
+    };
+
+    info!("Connecting to socket: {:?}", path);
+
+    let stream = UnixStream::connect(&path)
+        .with_context(|| format!("Failed to connect to socket: {:?}", path))?;
+
+    stream.set_nonblocking(true)
+        .context("Failed to set non-blocking")?;
+
+    Ok(stream)
+}
+
+/// Context for typing operations
+struct TypeContext {
+    connection: reis::event::Connection,
+    device: reis::event::Device,
+    keyboard: ei::Keyboard,
+    keymap: Option<xkb::Keymap>,
+    xkb_state: Option<xkb::State>,
+    key_to_keycode: HashMap<String, u32>,
+    delay: Duration,
+    held_modifiers: Vec<u32>,
+    sequence: u32,
+}
+
+impl TypeContext {
+    fn new(
+        connection: reis::event::Connection,
+        device: reis::event::Device,
+        keyboard: ei::Keyboard,
+        delay: Duration,
+    ) -> Self {
+        Self {
+            connection,
+            device,
+            keyboard,
+            keymap: None,
+            xkb_state: None,
+            key_to_keycode: build_key_to_keycode_map(),
+            delay,
+            held_modifiers: Vec::new(),
+            sequence: 1,
+        }
+    }
+
+    fn setup_keymap(&mut self) -> Result<()> {
+        if let Some(keymap_info) = self.device.keymap() {
+            let xkb_context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+
+            // We need to duplicate the fd since new_from_fd takes ownership
+            use std::os::fd::FromRawFd;
+            use std::os::fd::IntoRawFd;
+            let fd_dup = rustix::io::dup(&keymap_info.fd)
+                .context("Failed to duplicate keymap fd")?;
+            let owned_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd_dup.into_raw_fd()) };
+
+            let keymap = unsafe {
+                xkb::Keymap::new_from_fd(
+                    &xkb_context,
+                    owned_fd,
+                    keymap_info.size as usize,
+                    xkb::KEYMAP_FORMAT_TEXT_V1,
+                    xkb::KEYMAP_COMPILE_NO_FLAGS,
+                )
+            }
+            .context("Failed to read keymap from fd")?
+            .context("Failed to compile keymap")?;
+
+            let state = xkb::State::new(&keymap);
+
+            self.keymap = Some(keymap);
+            self.xkb_state = Some(state);
+            info!("Keymap loaded successfully");
+        }
+        Ok(())
+    }
+
+    fn start_emulating(&mut self) -> Result<()> {
+        let serial = self.connection.serial();
+        self.device.device().start_emulating(serial, self.sequence);
+        self.sequence += 1;
+        self.connection.flush()?;
+        Ok(())
+    }
+
+    fn stop_emulating(&mut self) -> Result<()> {
+        let serial = self.connection.serial();
+        self.device.device().stop_emulating(serial);
+        self.connection.flush()?;
+        Ok(())
+    }
+
+    fn send_frame(&self) -> Result<()> {
+        let serial = self.connection.serial();
+        let timestamp = get_timestamp();
+        self.device.device().frame(serial, timestamp);
+        self.connection.flush()?;
+        Ok(())
+    }
+
+    fn press_key(&self, keycode: u32) -> Result<()> {
+        trace!("Pressing key: {}", keycode);
+        self.keyboard.key(keycode, KeyState::Press);
+        self.send_frame()?;
+        Ok(())
+    }
+
+    fn release_key(&self, keycode: u32) -> Result<()> {
+        trace!("Releasing key: {}", keycode);
+        self.keyboard.key(keycode, KeyState::Released);
+        self.send_frame()?;
+        Ok(())
+    }
+
+    fn tap_key(&self, keycode: u32) -> Result<()> {
+        self.press_key(keycode)?;
+        if !self.delay.is_zero() {
+            std::thread::sleep(self.delay);
+        }
+        self.release_key(keycode)?;
+        if !self.delay.is_zero() {
+            std::thread::sleep(self.delay);
+        }
+        Ok(())
+    }
+
+    fn type_char(&self, ch: char) -> Result<()> {
+        trace!("Typing character: {:?}", ch);
+
+        if let (Some(keymap), Some(xkb_state)) = (&self.keymap, &self.xkb_state) {
+            // Use keymap to find the correct keycode
+            let (keycode, need_shift) = find_keycode_for_char(ch, keymap, xkb_state)?;
+
+            if need_shift {
+                let shift_keycode = self.key_to_keycode.get("shift").copied().unwrap_or(42);
+                self.press_key(shift_keycode)?;
+            }
+
+            self.tap_key(keycode)?;
+
+            if need_shift {
+                let shift_keycode = self.key_to_keycode.get("shift").copied().unwrap_or(42);
+                self.release_key(shift_keycode)?;
+            }
+        } else {
+            // Fallback: try to find keycode from our map
+            let ch_lower = ch.to_ascii_lowercase();
+            if let Some(&keycode) = self.key_to_keycode.get(&ch_lower.to_string()) {
+                let need_shift = ch.is_ascii_uppercase();
+
+                if need_shift {
+                    let shift_keycode = self.key_to_keycode.get("shift").copied().unwrap_or(42);
+                    self.press_key(shift_keycode)?;
+                }
+
+                self.tap_key(keycode)?;
+
+                if need_shift {
+                    let shift_keycode = self.key_to_keycode.get("shift").copied().unwrap_or(42);
+                    self.release_key(shift_keycode)?;
+                }
+            } else {
+                warn!("Could not find keycode for character: {:?}", ch);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn type_text(&self, text: &str) -> Result<()> {
+        debug!("Typing text: {:?}", text);
+        for ch in text.chars() {
+            self.type_char(ch)?;
+        }
+        Ok(())
+    }
+
+    fn press_special_key(&self, key_name: &str) -> Result<()> {
+        let keycode = self.key_to_keycode
+            .get(&key_name.to_lowercase())
+            .copied()
+            .ok_or_else(|| anyhow!("Unknown key: {}", key_name))?;
+
+        debug!("Pressing special key: {} (keycode {})", key_name, keycode);
+        self.tap_key(keycode)
+    }
+
+    fn hold_modifier(&mut self, mod_name: &str) -> Result<()> {
+        let keycode = self.key_to_keycode
+            .get(&mod_name.to_lowercase())
+            .copied()
+            .ok_or_else(|| anyhow!("Unknown modifier: {}", mod_name))?;
+
+        debug!("Holding modifier: {} (keycode {})", mod_name, keycode);
+        self.press_key(keycode)?;
+        self.held_modifiers.push(keycode);
+        Ok(())
+    }
+
+    fn press_modifier(&self, mod_name: &str) -> Result<()> {
+        let keycode = self.key_to_keycode
+            .get(&mod_name.to_lowercase())
+            .copied()
+            .ok_or_else(|| anyhow!("Unknown modifier: {}", mod_name))?;
+
+        debug!("Pressing modifier: {} (keycode {})", mod_name, keycode);
+        self.tap_key(keycode)
+    }
+
+    fn release_held_modifiers(&mut self) -> Result<()> {
+        for keycode in self.held_modifiers.drain(..).rev().collect::<Vec<_>>() {
+            debug!("Releasing held modifier keycode {}", keycode);
+            self.release_key(keycode)?;
+        }
+        Ok(())
+    }
+
+    fn execute_actions(&mut self, actions: &[Action]) -> Result<()> {
+        info!("Executing {} actions", actions.len());
+
+        for action in actions {
+            match action {
+                Action::Type(text) => {
+                    self.type_text(text)?;
+                }
+                Action::Key(key_name) => {
+                    self.press_special_key(key_name)?;
+                }
+                Action::ModifierHold(mod_name) => {
+                    self.hold_modifier(mod_name)?;
+                }
+                Action::ModifierPress(mod_name) => {
+                    self.press_modifier(mod_name)?;
+                }
+            }
+        }
+
+        // Release any held modifiers
+        self.release_held_modifiers()?;
+
+        Ok(())
+    }
+}
+
+fn run(args: Args) -> Result<()> {
+    // Build the list of actions
+    let mut actions = Vec::new();
+
+    // Add held modifiers first
+    for m in &args.modifiers {
+        actions.push(Action::ModifierHold(m.clone()));
+    }
+
+    // Interleave text, keys, and pressed modifiers
+    for text in &args.text {
+        actions.push(Action::Type(text.clone()));
+    }
+
+    for key in &args.keys {
+        actions.push(Action::Key(key.clone()));
+    }
+
+    for m in &args.press_modifiers {
+        actions.push(Action::ModifierPress(m.clone()));
+    }
+
+    if actions.is_empty() {
+        bail!("No text or keys to type. Use --help for usage.");
+    }
+
+    let delay = Duration::from_millis(args.delay);
+
+    // Connect to EI
+    let stream = if args.portal {
+        connect_via_portal()?
+    } else {
+        connect_via_socket(args.socket.as_deref())?
+    };
+
+    // Create EI context
+    let context = ei::Context::new(stream)
+        .context("Failed to create EI context")?;
+
+    // Perform handshake
+    info!("Performing handshake...");
+    let (connection, mut event_iter) = context.handshake_blocking("eitype", ContextType::Sender)
+        .context("Handshake failed")?;
+
+    info!("Connected! Waiting for devices...");
+
+    // Process events until we get a keyboard device
+    let mut type_ctx: Option<TypeContext> = None;
+
+    for event_result in &mut event_iter {
+        let event = event_result.context("Error processing event")?;
+        trace!("Received event: {:?}", event);
+
+        match event {
+            EiEvent::Disconnected(disconnected) => {
+                let reason = disconnected.reason;
+                let explanation = &disconnected.explanation;
+                error!("Disconnected: {:?} - {}", reason, explanation);
+                bail!("Disconnected from EI server");
+            }
+
+            EiEvent::SeatAdded(seat_added) => {
+                let seat = &seat_added.seat;
+                debug!("Seat added: {:?}", seat.name());
+                seat.bind_capabilities(&[DeviceCapability::Keyboard]);
+                connection.flush()?;
+            }
+
+            EiEvent::DeviceAdded(device_added) => {
+                let device = &device_added.device;
+                debug!("Device added: {:?}", device.name());
+            }
+
+            EiEvent::DeviceResumed(device_resumed) => {
+                let device = device_resumed.device.clone();
+                debug!("Device resumed: {:?}", device.name());
+
+                if let Some(keyboard) = device.interface::<ei::Keyboard>() {
+                    info!("Keyboard device available: {:?}", device.name());
+
+                    let mut ctx = TypeContext::new(
+                        connection.clone(),
+                        device,
+                        keyboard,
+                        delay,
+                    );
+
+                    // Setup keymap if available
+                    ctx.setup_keymap()?;
+
+                    type_ctx = Some(ctx);
+                    break;
+                }
+            }
+
+            EiEvent::DevicePaused(paused) => {
+                debug!("Device paused: {:?}", paused.device.name());
+            }
+
+            EiEvent::DeviceRemoved(removed) => {
+                debug!("Device removed: {:?}", removed.device.name());
+            }
+
+            _ => {
+                trace!("Other event");
+            }
+        }
+    }
+
+    let Some(mut ctx) = type_ctx else {
+        bail!("No keyboard device found");
+    };
+
+    // Start emulating and execute actions
+    ctx.start_emulating()?;
+
+    if let Err(e) = ctx.execute_actions(&actions) {
+        error!("Error executing actions: {}", e);
+        ctx.release_held_modifiers()?;
+        ctx.stop_emulating()?;
+        return Err(e);
+    }
+
+    ctx.stop_emulating()?;
+
+    info!("Done");
+    Ok(())
+}
+
+fn main() {
+    let args = Args::parse();
+
+    // Setup logging
+    let log_level = match args.verbose {
+        0 => log::LevelFilter::Warn,
+        1 => log::LevelFilter::Info,
+        2 => log::LevelFilter::Debug,
+        _ => log::LevelFilter::Trace,
+    };
+
+    env_logger::Builder::new()
+        .filter_level(log_level)
+        .format_timestamp(None)
+        .init();
+
+    if let Err(e) = run(args) {
+        error!("{:#}", e);
+        std::process::exit(1);
+    }
+}
