@@ -45,9 +45,55 @@ struct Args {
     #[arg(short = 's', long, value_name = "PATH")]
     socket: Option<String>,
 
+    /// XKB keyboard layout (e.g., "us", "de", "fr"). Overrides XKB_DEFAULT_LAYOUT env var.
+    #[arg(short = 'l', long, value_name = "LAYOUT")]
+    layout: Option<String>,
+
+    /// XKB keyboard variant (e.g., "dvorak", "colemak"). Overrides XKB_DEFAULT_VARIANT env var.
+    #[arg(long, value_name = "VARIANT")]
+    variant: Option<String>,
+
+    /// XKB keyboard model (e.g., "pc104", "pc105"). Overrides XKB_DEFAULT_MODEL env var.
+    #[arg(long, value_name = "MODEL")]
+    model: Option<String>,
+
+    /// XKB keyboard options (e.g., "ctrl:nocaps"). Overrides XKB_DEFAULT_OPTIONS env var.
+    #[arg(long, value_name = "OPTIONS")]
+    options: Option<String>,
+
     /// Verbose output
     #[arg(short = 'v', long, action = clap::ArgAction::Count)]
     verbose: u8,
+}
+
+/// XKB keyboard configuration
+#[derive(Debug, Clone, Default)]
+struct XkbConfig {
+    rules: Option<String>,
+    model: Option<String>,
+    layout: Option<String>,
+    variant: Option<String>,
+    options: Option<String>,
+}
+
+impl XkbConfig {
+    /// Create XkbConfig from CLI args and environment variables
+    /// CLI args take precedence over environment variables
+    fn from_args_and_env(args: &Args) -> Self {
+        Self {
+            rules: std::env::var("XKB_DEFAULT_RULES").ok(),
+            model: args.model.clone().or_else(|| std::env::var("XKB_DEFAULT_MODEL").ok()),
+            layout: args.layout.clone().or_else(|| std::env::var("XKB_DEFAULT_LAYOUT").ok()),
+            variant: args.variant.clone().or_else(|| std::env::var("XKB_DEFAULT_VARIANT").ok()),
+            options: args.options.clone().or_else(|| std::env::var("XKB_DEFAULT_OPTIONS").ok()),
+        }
+    }
+
+    /// Check if any XKB configuration is specified
+    fn is_specified(&self) -> bool {
+        self.rules.is_some() || self.model.is_some() || self.layout.is_some()
+            || self.variant.is_some() || self.options.is_some()
+    }
 }
 
 /// Actions to perform after connection is established
@@ -272,6 +318,7 @@ struct TypeContext {
     delay: Duration,
     held_modifiers: Vec<u32>,
     sequence: u32,
+    xkb_config: XkbConfig,
 }
 
 impl TypeContext {
@@ -280,6 +327,7 @@ impl TypeContext {
         device: reis::event::Device,
         keyboard: ei::Keyboard,
         delay: Duration,
+        xkb_config: XkbConfig,
     ) -> Self {
         Self {
             connection,
@@ -291,13 +339,15 @@ impl TypeContext {
             delay,
             held_modifiers: Vec::new(),
             sequence: 1,
+            xkb_config,
         }
     }
 
     fn setup_keymap(&mut self) -> Result<()> {
-        if let Some(keymap_info) = self.device.keymap() {
-            let xkb_context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let xkb_context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
 
+        // First, try to use the keymap provided by the EI server
+        if let Some(keymap_info) = self.device.keymap() {
             // We need to duplicate the fd since new_from_fd takes ownership
             use std::os::fd::FromRawFd;
             use std::os::fd::IntoRawFd;
@@ -321,8 +371,43 @@ impl TypeContext {
 
             self.keymap = Some(keymap);
             self.xkb_state = Some(state);
-            info!("Keymap loaded successfully");
+            info!("Keymap loaded from EI server");
+            return Ok(());
         }
+
+        // Fallback: use XKB configuration from CLI/environment or system defaults
+        let rules = self.xkb_config.rules.as_deref().unwrap_or("");
+        let model = self.xkb_config.model.as_deref().unwrap_or("");
+        let layout = self.xkb_config.layout.as_deref().unwrap_or("");
+        let variant = self.xkb_config.variant.as_deref().unwrap_or("");
+        let options = self.xkb_config.options.clone();
+
+        if self.xkb_config.is_specified() {
+            info!(
+                "Loading keymap from configuration: layout={}, variant={}, model={}",
+                if layout.is_empty() { "(default)" } else { layout },
+                if variant.is_empty() { "(none)" } else { variant },
+                if model.is_empty() { "(default)" } else { model }
+            );
+        } else {
+            info!("Loading system default keymap");
+        }
+
+        let keymap = xkb::Keymap::new_from_names(
+            &xkb_context,
+            rules,
+            model,
+            layout,
+            variant,
+            options,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .context("Failed to load keymap from XKB configuration")?;
+
+        let state = xkb::State::new(&keymap);
+
+        self.keymap = Some(keymap);
+        self.xkb_state = Some(state);
         Ok(())
     }
 
@@ -520,6 +605,7 @@ fn run(args: Args) -> Result<()> {
     }
 
     let delay = Duration::from_millis(args.delay);
+    let xkb_config = XkbConfig::from_args_and_env(&args);
 
     // Connect to EI
     let stream = if args.portal {
@@ -578,9 +664,10 @@ fn run(args: Args) -> Result<()> {
                         device,
                         keyboard,
                         delay,
+                        xkb_config.clone(),
                     );
 
-                    // Setup keymap if available
+                    // Setup keymap (from EI server, CLI/env config, or system default)
                     ctx.setup_keymap()?;
 
                     type_ctx = Some(ctx);
@@ -854,6 +941,91 @@ mod tests {
             Action::ModifierPress(s) => assert_eq!(s, "shift"),
             _ => panic!("Wrong variant"),
         }
+    }
+
+    #[test]
+    fn test_xkb_config_default() {
+        let config = XkbConfig::default();
+        assert!(config.rules.is_none());
+        assert!(config.model.is_none());
+        assert!(config.layout.is_none());
+        assert!(config.variant.is_none());
+        assert!(config.options.is_none());
+        assert!(!config.is_specified());
+    }
+
+    #[test]
+    fn test_xkb_config_is_specified() {
+        let mut config = XkbConfig::default();
+        assert!(!config.is_specified());
+
+        config.layout = Some("us".to_string());
+        assert!(config.is_specified());
+
+        config.layout = None;
+        config.variant = Some("dvorak".to_string());
+        assert!(config.is_specified());
+    }
+
+    #[test]
+    fn test_cli_parsing_layout() {
+        let args = Args::try_parse_from(["eitype", "-l", "de", "hello"]).unwrap();
+        assert_eq!(args.layout, Some("de".to_string()));
+    }
+
+    #[test]
+    fn test_cli_parsing_layout_long() {
+        let args = Args::try_parse_from(["eitype", "--layout", "fr", "hello"]).unwrap();
+        assert_eq!(args.layout, Some("fr".to_string()));
+    }
+
+    #[test]
+    fn test_cli_parsing_variant() {
+        let args = Args::try_parse_from(["eitype", "--variant", "dvorak", "hello"]).unwrap();
+        assert_eq!(args.variant, Some("dvorak".to_string()));
+    }
+
+    #[test]
+    fn test_cli_parsing_model() {
+        let args = Args::try_parse_from(["eitype", "--model", "pc105", "hello"]).unwrap();
+        assert_eq!(args.model, Some("pc105".to_string()));
+    }
+
+    #[test]
+    fn test_cli_parsing_options() {
+        let args = Args::try_parse_from(["eitype", "--options", "ctrl:nocaps", "hello"]).unwrap();
+        assert_eq!(args.options, Some("ctrl:nocaps".to_string()));
+    }
+
+    #[test]
+    fn test_cli_parsing_full_xkb_config() {
+        let args = Args::try_parse_from([
+            "eitype",
+            "-l", "us",
+            "--variant", "dvorak",
+            "--model", "pc104",
+            "--options", "ctrl:nocaps",
+            "hello"
+        ]).unwrap();
+        assert_eq!(args.layout, Some("us".to_string()));
+        assert_eq!(args.variant, Some("dvorak".to_string()));
+        assert_eq!(args.model, Some("pc104".to_string()));
+        assert_eq!(args.options, Some("ctrl:nocaps".to_string()));
+    }
+
+    #[test]
+    fn test_xkb_config_from_args() {
+        let args = Args::try_parse_from([
+            "eitype",
+            "-l", "de",
+            "--variant", "nodeadkeys",
+            "hello"
+        ]).unwrap();
+
+        let config = XkbConfig::from_args_and_env(&args);
+        assert_eq!(config.layout, Some("de".to_string()));
+        assert_eq!(config.variant, Some("nodeadkeys".to_string()));
+        assert!(config.is_specified());
     }
 }
 

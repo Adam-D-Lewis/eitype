@@ -10,6 +10,7 @@ A wtype-like CLI tool for typing text using Emulated Input (EI) protocol on Wayl
 - XDG RemoteDesktop portal support
 - Direct socket connection support
 - Configurable delay between key events
+- Keyboard layout configuration via CLI or environment variables
 
 ## Installation
 
@@ -99,6 +100,46 @@ Supported modifier names (case-insensitive):
 - `ctrl`, `control`, `lctrl`, `rctrl`
 - `alt`, `lalt`, `ralt`, `altgr`
 - `super`, `meta`, `win`, `lsuper`, `rsuper`
+
+## Keyboard Layout
+
+eitype uses XKB for keyboard layout handling. The keymap is determined in the following order:
+
+1. **EI server keymap** - If the EI server provides a keymap, it is used automatically
+2. **CLI/environment configuration** - If no server keymap, uses specified layout
+3. **System default** - Falls back to the system's default XKB configuration
+
+### CLI Options
+
+```bash
+# Use German keyboard layout
+eitype -l de "Hallo Welt"
+
+# Use US Dvorak layout
+eitype -l us --variant dvorak "Hello"
+
+# Full XKB configuration
+eitype -l us --variant dvorak --model pc104 --options "ctrl:nocaps" "Hello"
+```
+
+### Environment Variables
+
+You can also set keyboard layout via environment variables (CLI options take precedence):
+
+- `XKB_DEFAULT_LAYOUT` - Keyboard layout (e.g., "us", "de", "fr")
+- `XKB_DEFAULT_VARIANT` - Layout variant (e.g., "dvorak", "colemak", "nodeadkeys")
+- `XKB_DEFAULT_MODEL` - Keyboard model (e.g., "pc104", "pc105")
+- `XKB_DEFAULT_OPTIONS` - XKB options (e.g., "ctrl:nocaps")
+- `XKB_DEFAULT_RULES` - XKB rules file
+
+```bash
+# Set German layout via environment
+export XKB_DEFAULT_LAYOUT=de
+eitype "Hallo"
+
+# Override with CLI
+XKB_DEFAULT_LAYOUT=de eitype -l fr "Bonjour"  # Uses French layout
+```
 
 ## License
 
