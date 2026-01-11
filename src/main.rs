@@ -643,3 +643,217 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_key_to_keycode_map_modifiers() {
+        let map = build_key_to_keycode_map();
+
+        // Test modifier keys
+        assert_eq!(map.get("shift"), Some(&42));
+        assert_eq!(map.get("lshift"), Some(&42));
+        assert_eq!(map.get("rshift"), Some(&54));
+        assert_eq!(map.get("ctrl"), Some(&29));
+        assert_eq!(map.get("control"), Some(&29));
+        assert_eq!(map.get("alt"), Some(&56));
+        assert_eq!(map.get("super"), Some(&125));
+        assert_eq!(map.get("meta"), Some(&125));
+        assert_eq!(map.get("win"), Some(&125));
+    }
+
+    #[test]
+    fn test_build_key_to_keycode_map_special_keys() {
+        let map = build_key_to_keycode_map();
+
+        // Test special keys
+        assert_eq!(map.get("escape"), Some(&1));
+        assert_eq!(map.get("esc"), Some(&1));
+        assert_eq!(map.get("return"), Some(&28));
+        assert_eq!(map.get("enter"), Some(&28));
+        assert_eq!(map.get("tab"), Some(&15));
+        assert_eq!(map.get("backspace"), Some(&14));
+        assert_eq!(map.get("space"), Some(&57));
+    }
+
+    #[test]
+    fn test_build_key_to_keycode_map_arrow_keys() {
+        let map = build_key_to_keycode_map();
+
+        // Test arrow keys
+        assert_eq!(map.get("up"), Some(&103));
+        assert_eq!(map.get("down"), Some(&108));
+        assert_eq!(map.get("left"), Some(&105));
+        assert_eq!(map.get("right"), Some(&106));
+    }
+
+    #[test]
+    fn test_build_key_to_keycode_map_function_keys() {
+        let map = build_key_to_keycode_map();
+
+        // Test function keys (F1=59, F2=60, etc.)
+        assert_eq!(map.get("f1"), Some(&59));
+        assert_eq!(map.get("f2"), Some(&60));
+        assert_eq!(map.get("f10"), Some(&68));
+        assert_eq!(map.get("f12"), Some(&70));
+    }
+
+    #[test]
+    fn test_build_key_to_keycode_map_letters() {
+        let map = build_key_to_keycode_map();
+
+        // Test some letter keys
+        assert_eq!(map.get("a"), Some(&30));
+        assert_eq!(map.get("b"), Some(&48));
+        assert_eq!(map.get("z"), Some(&44));
+    }
+
+    #[test]
+    fn test_build_key_to_keycode_map_numbers() {
+        let map = build_key_to_keycode_map();
+
+        // Test number keys
+        assert_eq!(map.get("0"), Some(&11));
+        assert_eq!(map.get("1"), Some(&2));
+        assert_eq!(map.get("9"), Some(&10));
+    }
+
+    #[test]
+    fn test_keysym_to_char_ascii() {
+        // Test ASCII printable range
+        assert_eq!(keysym_to_char(0x20), Some(' '));
+        assert_eq!(keysym_to_char(0x41), Some('A'));
+        assert_eq!(keysym_to_char(0x61), Some('a'));
+        assert_eq!(keysym_to_char(0x7a), Some('z'));
+        assert_eq!(keysym_to_char(0x30), Some('0'));
+        assert_eq!(keysym_to_char(0x39), Some('9'));
+    }
+
+    #[test]
+    fn test_keysym_to_char_special() {
+        // Test special keysyms
+        assert_eq!(keysym_to_char(0xff0d), Some('\n')); // Return
+        assert_eq!(keysym_to_char(0xff09), Some('\t')); // Tab
+    }
+
+    #[test]
+    fn test_keysym_to_char_unicode() {
+        // Test Unicode keysyms (0x1000000 + unicode code point)
+        assert_eq!(keysym_to_char(0x1000000 + 0x00e9), Some('é')); // é
+        assert_eq!(keysym_to_char(0x1000000 + 0x00f1), Some('ñ')); // ñ
+    }
+
+    #[test]
+    fn test_keysym_to_char_latin1_supplement() {
+        // Test Latin-1 supplement range (0xa0-0xff)
+        assert_eq!(keysym_to_char(0xa0), Some('\u{a0}')); // Non-breaking space
+        assert_eq!(keysym_to_char(0xe9), Some('é'));
+        assert_eq!(keysym_to_char(0xf1), Some('ñ'));
+    }
+
+    #[test]
+    fn test_keysym_to_char_invalid() {
+        // Test invalid/unmapped keysyms
+        assert_eq!(keysym_to_char(0x00), None);
+        assert_eq!(keysym_to_char(0x1f), None); // Below ASCII printable
+        assert_eq!(keysym_to_char(0x7f), None); // DEL character
+        assert_eq!(keysym_to_char(0xff00), None); // Unknown special keysym
+    }
+
+    #[test]
+    fn test_get_timestamp_monotonic() {
+        // Test that timestamps are monotonically increasing
+        let t1 = get_timestamp();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let t2 = get_timestamp();
+        assert!(t2 >= t1, "Timestamps should be monotonically increasing");
+    }
+
+    #[test]
+    fn test_cli_parsing_basic() {
+        // Test basic CLI parsing
+        let args = Args::try_parse_from(["eitype", "hello"]).unwrap();
+        assert_eq!(args.text, vec!["hello"]);
+        assert_eq!(args.delay, 0);
+        assert!(!args.portal);
+    }
+
+    #[test]
+    fn test_cli_parsing_multiple_text() {
+        let args = Args::try_parse_from(["eitype", "hello", "world"]).unwrap();
+        assert_eq!(args.text, vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn test_cli_parsing_delay() {
+        let args = Args::try_parse_from(["eitype", "-d", "100", "hello"]).unwrap();
+        assert_eq!(args.delay, 100);
+    }
+
+    #[test]
+    fn test_cli_parsing_portal() {
+        let args = Args::try_parse_from(["eitype", "-p", "hello"]).unwrap();
+        assert!(args.portal);
+    }
+
+    #[test]
+    fn test_cli_parsing_keys() {
+        let args = Args::try_parse_from(["eitype", "-k", "return", "-k", "tab"]).unwrap();
+        assert_eq!(args.keys, vec!["return", "tab"]);
+    }
+
+    #[test]
+    fn test_cli_parsing_modifiers() {
+        let args = Args::try_parse_from(["eitype", "-M", "ctrl", "-M", "shift", "c"]).unwrap();
+        assert_eq!(args.modifiers, vec!["ctrl", "shift"]);
+        assert_eq!(args.text, vec!["c"]);
+    }
+
+    #[test]
+    fn test_cli_parsing_socket() {
+        let args = Args::try_parse_from(["eitype", "-s", "/tmp/eis-0", "hello"]).unwrap();
+        assert_eq!(args.socket, Some("/tmp/eis-0".to_string()));
+    }
+
+    #[test]
+    fn test_cli_parsing_verbose() {
+        let args = Args::try_parse_from(["eitype", "-v", "hello"]).unwrap();
+        assert_eq!(args.verbose, 1);
+
+        let args = Args::try_parse_from(["eitype", "-vv", "hello"]).unwrap();
+        assert_eq!(args.verbose, 2);
+
+        let args = Args::try_parse_from(["eitype", "-vvv", "hello"]).unwrap();
+        assert_eq!(args.verbose, 3);
+    }
+
+    #[test]
+    fn test_action_enum() {
+        // Test Action enum variants
+        let type_action = Action::Type("hello".to_string());
+        let key_action = Action::Key("return".to_string());
+        let mod_hold = Action::ModifierHold("ctrl".to_string());
+        let mod_press = Action::ModifierPress("shift".to_string());
+
+        // Just verify they can be created and matched
+        match type_action {
+            Action::Type(s) => assert_eq!(s, "hello"),
+            _ => panic!("Wrong variant"),
+        }
+        match key_action {
+            Action::Key(s) => assert_eq!(s, "return"),
+            _ => panic!("Wrong variant"),
+        }
+        match mod_hold {
+            Action::ModifierHold(s) => assert_eq!(s, "ctrl"),
+            _ => panic!("Wrong variant"),
+        }
+        match mod_press {
+            Action::ModifierPress(s) => assert_eq!(s, "shift"),
+            _ => panic!("Wrong variant"),
+        }
+    }
+}
+
