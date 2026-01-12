@@ -9,9 +9,60 @@ use log::{debug, error, info, trace, warn};
 use reis::ei::{self, handshake::ContextType, keyboard::KeyState};
 use reis::event::{DeviceCapability, EiEvent};
 use std::collections::HashMap;
+use std::fs;
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use xkbcommon::xkb;
+
+// Token storage for portal session persistence
+fn get_token_path() -> PathBuf {
+    let cache_dir = std::env::var("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            PathBuf::from(home).join(".cache")
+        });
+    cache_dir.join("eitype").join("restore_token")
+}
+
+fn load_restore_token() -> Option<String> {
+    let path = get_token_path();
+    match fs::read_to_string(&path) {
+        Ok(token) => {
+            let token = token.trim().to_string();
+            if !token.is_empty() {
+                info!("Loaded restore token from {:?}", path);
+                Some(token)
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+fn save_restore_token(token: &str) -> Result<()> {
+    let path = get_token_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create token directory: {:?}", parent))?;
+    }
+    fs::write(&path, token)
+        .with_context(|| format!("Failed to save restore token to {:?}", path))?;
+    info!("Saved restore token to {:?}", path);
+    Ok(())
+}
+
+fn clear_restore_token() -> Result<()> {
+    let path = get_token_path();
+    if path.exists() {
+        fs::remove_file(&path)
+            .with_context(|| format!("Failed to remove token file: {:?}", path))?;
+        info!("Cleared restore token from {:?}", path);
+    }
+    Ok(())
+}
 
 /// A wtype-like tool for typing text using Emulated Input (EI) protocol
 #[derive(Parser, Debug)]
@@ -37,11 +88,8 @@ struct Args {
     #[arg(short = 'P', long = "press-mod", value_name = "MOD")]
     press_modifiers: Vec<String>,
 
-    /// Use XDG RemoteDesktop portal for connection
-    #[arg(short = 'p', long)]
-    portal: bool,
-
-    /// Socket path (defaults to LIBEI_SOCKET environment variable)
+    /// Socket path for direct connection (defaults to LIBEI_SOCKET env var).
+    /// If not specified, uses XDG RemoteDesktop portal.
     #[arg(short = 's', long, value_name = "PATH")]
     socket: Option<String>,
 
@@ -69,6 +117,10 @@ struct Args {
     /// Verbose output
     #[arg(short = 'v', long, action = clap::ArgAction::Count)]
     verbose: u8,
+
+    /// Clear saved portal session token and force new authorization dialog
+    #[arg(long)]
+    reset_token: bool,
 }
 
 /// XKB keyboard configuration
@@ -259,12 +311,16 @@ fn get_timestamp() -> u64 {
     start.elapsed().as_micros() as u64
 }
 
-/// Connect to EI via the XDG RemoteDesktop portal
-fn connect_via_portal() -> Result<UnixStream> {
+/// Connect to EI via the XDG RemoteDesktop portal with session persistence support.
+/// Returns the stream and optionally a new restore token for future sessions.
+fn connect_via_portal(restore_token: Option<&str>) -> Result<(UnixStream, Option<String>)> {
     use ashpd::desktop::remote_desktop::{DeviceType, RemoteDesktop};
     use ashpd::desktop::PersistMode;
 
     info!("Connecting via XDG RemoteDesktop portal...");
+    if restore_token.is_some() {
+        info!("Using saved restore token for session persistence");
+    }
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -278,11 +334,25 @@ fn connect_via_portal() -> Result<UnixStream> {
         let session = proxy.create_session().await
             .context("Failed to create session")?;
 
-        proxy.select_devices(&session, DeviceType::Keyboard.into(), None, PersistMode::DoNot).await
-            .context("Failed to select devices")?;
+        // Use ExplicitlyRevoked for permanent persistence (survives app restarts)
+        // Pass restore_token if available to skip the authorization dialog
+        proxy.select_devices(
+            &session,
+            DeviceType::Keyboard.into(),
+            restore_token,
+            PersistMode::ExplicitlyRevoked,
+        ).await.context("Failed to select devices")?;
 
-        let _response = proxy.start(&session, None).await
-            .context("Failed to start session")?;
+        let response = proxy.start(&session, None).await
+            .context("Failed to start session")?
+            .response()
+            .context("Failed to get session response")?;
+
+        // Extract the new restore token for future sessions
+        let new_token = response.restore_token().map(|s| s.to_string());
+        if new_token.is_some() {
+            debug!("Received new restore token from portal");
+        }
 
         let fd = proxy.connect_to_eis(&session).await
             .context("Failed to connect to EIS")?;
@@ -291,25 +361,29 @@ fn connect_via_portal() -> Result<UnixStream> {
         stream.set_nonblocking(true)
             .context("Failed to set non-blocking")?;
 
-        Ok(stream)
+        Ok((stream, new_token))
     })
 }
 
-/// Connect to EI via socket
-fn connect_via_socket(socket_path: Option<&str>) -> Result<UnixStream> {
-    let path = if let Some(path) = socket_path {
-        std::path::PathBuf::from(path)
-    } else if let Ok(socket) = std::env::var("LIBEI_SOCKET") {
-        let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-            .context("XDG_RUNTIME_DIR not set")?;
-        std::path::Path::new(&runtime_dir).join(socket)
-    } else {
-        bail!("No socket path provided and LIBEI_SOCKET not set. Use -p for portal or -s for socket path.");
-    };
+/// Get socket path from CLI arg or LIBEI_SOCKET environment variable.
+/// Returns None if no socket is configured.
+fn get_socket_path(socket_arg: Option<&str>) -> Option<PathBuf> {
+    if let Some(path) = socket_arg {
+        return Some(PathBuf::from(path));
+    }
+    if let Ok(socket) = std::env::var("LIBEI_SOCKET") {
+        if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+            return Some(std::path::Path::new(&runtime_dir).join(socket));
+        }
+    }
+    None
+}
 
+/// Connect to EI via socket
+fn connect_via_socket(path: &std::path::Path) -> Result<UnixStream> {
     info!("Connecting to socket: {:?}", path);
 
-    let stream = UnixStream::connect(&path)
+    let stream = UnixStream::connect(path)
         .with_context(|| format!("Failed to connect to socket: {:?}", path))?;
 
     stream.set_nonblocking(true)
@@ -659,11 +733,33 @@ fn run(args: Args) -> Result<()> {
     let delay = Duration::from_millis(args.delay);
     let xkb_config = XkbConfig::from_args_and_env(&args);
 
-    // Connect to EI
-    let stream = if args.portal {
-        connect_via_portal()?
+    // Handle --reset-token flag
+    if args.reset_token {
+        clear_restore_token()?;
+    }
+
+    // Connect to EI: use socket if specified, otherwise default to portal
+    let stream = if let Some(socket_path) = get_socket_path(args.socket.as_deref()) {
+        // Socket path specified via -s or LIBEI_SOCKET
+        connect_via_socket(&socket_path)?
     } else {
-        connect_via_socket(args.socket.as_deref())?
+        // Default to portal (with session persistence)
+        let saved_token = if args.reset_token {
+            None
+        } else {
+            load_restore_token()
+        };
+
+        let (stream, new_token) = connect_via_portal(saved_token.as_deref())?;
+
+        // Save new token for future runs
+        if let Some(token) = new_token {
+            if let Err(e) = save_restore_token(&token) {
+                warn!("Failed to save restore token: {}", e);
+            }
+        }
+
+        stream
     };
 
     // Create EI context
@@ -917,7 +1013,6 @@ mod tests {
         let args = Args::try_parse_from(["eitype", "hello"]).unwrap();
         assert_eq!(args.text, vec!["hello"]);
         assert_eq!(args.delay, 0);
-        assert!(!args.portal);
     }
 
     #[test]
@@ -930,12 +1025,6 @@ mod tests {
     fn test_cli_parsing_delay() {
         let args = Args::try_parse_from(["eitype", "-d", "100", "hello"]).unwrap();
         assert_eq!(args.delay, 100);
-    }
-
-    #[test]
-    fn test_cli_parsing_portal() {
-        let args = Args::try_parse_from(["eitype", "-p", "hello"]).unwrap();
-        assert!(args.portal);
     }
 
     #[test]

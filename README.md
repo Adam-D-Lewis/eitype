@@ -7,7 +7,7 @@ A wtype-like CLI tool for typing text using Emulated Input (EI) protocol on Wayl
 - Type text using the EI (Emulated Input) protocol
 - Support for special keys (enter, tab, escape, arrows, function keys, etc.)
 - Support for modifier keys (shift, ctrl, alt, super)
-- XDG RemoteDesktop portal support
+- XDG RemoteDesktop portal support with session persistence
 - Direct socket connection support
 - Configurable delay between key events
 - Keyboard layout configuration via CLI or environment variables
@@ -26,11 +26,8 @@ cargo install --path .
 ## Usage
 
 ```bash
-# Type text (requires EI server or portal)
+# Type text (uses XDG RemoteDesktop portal by default)
 eitype "Hello, World!"
-
-# Type text using the XDG RemoteDesktop portal
-eitype -p "Hello, World!"
 
 # Type with delay between keys (10ms)
 eitype -d 10 "Slow typing..."
@@ -56,17 +53,31 @@ eitype -vv "More debug"
 
 ## Connection Methods
 
-### XDG RemoteDesktop Portal (Recommended)
+### XDG RemoteDesktop Portal (Default)
 
-Use the `-p` flag to connect via the XDG RemoteDesktop portal. This is the recommended method for desktop environments that support it (GNOME, KDE, etc.).
+By default, eitype connects via the XDG RemoteDesktop portal. This works with desktop environments that support it (GNOME, KDE, etc.).
 
 ```bash
-eitype -p "Hello"
+eitype "Hello"
+```
+
+#### Session Persistence
+
+eitype automatically saves a session token to avoid the authorization dialog on subsequent runs. The token is stored at `~/.cache/eitype/restore_token`.
+
+- **First run**: Shows the authorization dialog, saves token for future use
+- **Subsequent runs**: Uses saved token, no dialog needed
+- **Token expiration**: If the token becomes invalid, a new dialog will appear
+
+To force a new authorization dialog (clear the saved token):
+
+```bash
+eitype --reset-token "Hello"
 ```
 
 ### Direct Socket
 
-Use the `-s` flag to specify a socket path, or set the `LIBEI_SOCKET` environment variable:
+Use the `-s` flag to specify a socket path, or set the `LIBEI_SOCKET` environment variable to bypass the portal:
 
 ```bash
 eitype -s /path/to/ei/socket "Hello"
@@ -133,7 +144,7 @@ If you need to use a different layout, specify it with `--layout-index`:
 
 ```bash
 # Use the second layout (index 1)
-eitype --layout-index 1 -p "Hello"
+eitype --layout-index 1 "Hello"
 ```
 
 Use `-vv` to see all available layouts in the keymap.
