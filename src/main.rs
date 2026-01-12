@@ -61,6 +61,11 @@ struct Args {
     #[arg(long, value_name = "OPTIONS")]
     options: Option<String>,
 
+    /// XKB layout index to use when multiple layouts are available (default: 0)
+    /// Use this when the server keymap has multiple layouts and you need to select one.
+    #[arg(long, value_name = "INDEX", default_value = "0")]
+    layout_index: u32,
+
     /// Verbose output
     #[arg(short = 'v', long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -183,21 +188,23 @@ fn build_key_to_keycode_map() -> HashMap<String, u32> {
 }
 
 /// Find the keycode for a character, and whether shift is needed
-fn find_keycode_for_char(ch: char, keymap: &xkb::Keymap, _xkb_state: &xkb::State) -> Result<(u32, bool)> {
+/// Only searches within the specified layout index (default 0 = first/active layout)
+fn find_keycode_for_char(ch: char, keymap: &xkb::Keymap, _xkb_state: &xkb::State, layout_index: u32) -> Result<(u32, bool)> {
     let min_keycode: u32 = keymap.min_keycode().into();
     let max_keycode: u32 = keymap.max_keycode().into();
 
-    // Try each keycode
+    // Try each keycode, but only search the specified layout
     for keycode_raw in min_keycode..=max_keycode {
         let keycode = xkb::Keycode::new(keycode_raw);
         // Get number of layouts for this key
         let num_layouts = keymap.num_layouts_for_key(keycode);
 
-        for layout in 0..num_layouts {
-            let num_levels = keymap.num_levels_for_key(keycode, layout);
+        // Only search the specified layout if it exists for this key
+        if layout_index < num_layouts {
+            let num_levels = keymap.num_levels_for_key(keycode, layout_index);
 
             for level in 0..num_levels {
-                let syms = keymap.key_get_syms_by_level(keycode, layout, level);
+                let syms = keymap.key_get_syms_by_level(keycode, layout_index, level);
 
                 for sym in syms {
                     // Convert keysym to character
@@ -256,11 +263,15 @@ fn get_timestamp() -> u64 {
 fn connect_via_portal() -> Result<UnixStream> {
     use ashpd::desktop::remote_desktop::{DeviceType, RemoteDesktop};
     use ashpd::desktop::PersistMode;
-    use futures_executor::block_on;
 
     info!("Connecting via XDG RemoteDesktop portal...");
 
-    block_on(async {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("Failed to create Tokio runtime")?;
+
+    rt.block_on(async {
         let proxy = RemoteDesktop::new().await
             .context("Failed to create RemoteDesktop proxy")?;
 
@@ -319,6 +330,7 @@ struct TypeContext {
     held_modifiers: Vec<u32>,
     sequence: u32,
     xkb_config: XkbConfig,
+    layout_index: u32,
 }
 
 impl TypeContext {
@@ -328,6 +340,7 @@ impl TypeContext {
         keyboard: ei::Keyboard,
         delay: Duration,
         xkb_config: XkbConfig,
+        layout_index: u32,
     ) -> Self {
         Self {
             connection,
@@ -340,13 +353,49 @@ impl TypeContext {
             held_modifiers: Vec::new(),
             sequence: 1,
             xkb_config,
+            layout_index,
         }
     }
 
     fn setup_keymap(&mut self) -> Result<()> {
         let xkb_context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
 
-        // First, try to use the keymap provided by the EI server
+        // If user specified a layout via CLI, use that (ignore server keymap)
+        // This is important because the compositor will apply its own keymap translation,
+        // so we need to send keycodes based on what physical keys would produce the characters
+        // on a standard QWERTY layout (or whatever the user specifies).
+        if self.xkb_config.is_specified() {
+            let rules = self.xkb_config.rules.as_deref().unwrap_or("");
+            let model = self.xkb_config.model.as_deref().unwrap_or("");
+            let layout = self.xkb_config.layout.as_deref().unwrap_or("");
+            let variant = self.xkb_config.variant.as_deref().unwrap_or("");
+            let options = self.xkb_config.options.clone();
+
+            info!(
+                "Loading keymap from CLI configuration: layout={}, variant={}, model={}",
+                if layout.is_empty() { "(default)" } else { layout },
+                if variant.is_empty() { "(none)" } else { variant },
+                if model.is_empty() { "(default)" } else { model }
+            );
+
+            let keymap = xkb::Keymap::new_from_names(
+                &xkb_context,
+                rules,
+                model,
+                layout,
+                variant,
+                options,
+                xkb::KEYMAP_COMPILE_NO_FLAGS,
+            )
+            .context("Failed to load keymap from XKB configuration")?;
+
+            let state = xkb::State::new(&keymap);
+            self.keymap = Some(keymap);
+            self.xkb_state = Some(state);
+            return Ok(());
+        }
+
+        // Try to use the keymap provided by the EI server
         if let Some(keymap_info) = self.device.keymap() {
             // We need to duplicate the fd since new_from_fd takes ownership
             use std::os::fd::FromRawFd;
@@ -369,40 +418,41 @@ impl TypeContext {
 
             let state = xkb::State::new(&keymap);
 
+            // Log the layout info from the server keymap
+            let num_layouts = keymap.num_layouts();
+            if num_layouts > 0 {
+                let layout_name = keymap.layout_get_name(0);
+                info!(
+                    "Keymap loaded from EI server: layout=\"{}\" ({} layout(s) available)",
+                    layout_name,
+                    num_layouts
+                );
+                // Log all available layouts for debugging
+                for i in 0..num_layouts {
+                    debug!("  Layout {}: \"{}\"", i, keymap.layout_get_name(i));
+                }
+            } else {
+                info!("Keymap loaded from EI server (no layout name available)");
+            }
+
             self.keymap = Some(keymap);
             self.xkb_state = Some(state);
-            info!("Keymap loaded from EI server");
             return Ok(());
         }
 
-        // Fallback: use XKB configuration from CLI/environment or system defaults
-        let rules = self.xkb_config.rules.as_deref().unwrap_or("");
-        let model = self.xkb_config.model.as_deref().unwrap_or("");
-        let layout = self.xkb_config.layout.as_deref().unwrap_or("");
-        let variant = self.xkb_config.variant.as_deref().unwrap_or("");
-        let options = self.xkb_config.options.clone();
-
-        if self.xkb_config.is_specified() {
-            info!(
-                "Loading keymap from configuration: layout={}, variant={}, model={}",
-                if layout.is_empty() { "(default)" } else { layout },
-                if variant.is_empty() { "(none)" } else { variant },
-                if model.is_empty() { "(default)" } else { model }
-            );
-        } else {
-            info!("Loading system default keymap");
-        }
+        // Fallback: use system default keymap (QWERTY)
+        info!("Loading system default keymap");
 
         let keymap = xkb::Keymap::new_from_names(
             &xkb_context,
-            rules,
-            model,
-            layout,
-            variant,
-            options,
+            "",
+            "",
+            "",
+            "",
+            None,
             xkb::KEYMAP_COMPILE_NO_FLAGS,
         )
-        .context("Failed to load keymap from XKB configuration")?;
+        .context("Failed to load system default keymap")?;
 
         let state = xkb::State::new(&keymap);
 
@@ -463,9 +513,11 @@ impl TypeContext {
     fn type_char(&self, ch: char) -> Result<()> {
         trace!("Typing character: {:?}", ch);
 
+        // Use XKB keymap to find the correct keycode.
+        // The keymap should match the compositor's active keymap so that when we send
+        // a keycode, the compositor translates it to the intended character.
         if let (Some(keymap), Some(xkb_state)) = (&self.keymap, &self.xkb_state) {
-            // Use keymap to find the correct keycode
-            let (keycode, need_shift) = find_keycode_for_char(ch, keymap, xkb_state)?;
+            let (keycode, need_shift) = find_keycode_for_char(ch, keymap, xkb_state, self.layout_index)?;
 
             if need_shift {
                 let shift_keycode = self.key_to_keycode.get("shift").copied().unwrap_or(42);
@@ -479,7 +531,7 @@ impl TypeContext {
                 self.release_key(shift_keycode)?;
             }
         } else {
-            // Fallback: try to find keycode from our map
+            // Fallback when no keymap: use hardcoded QWERTY map
             let ch_lower = ch.to_ascii_lowercase();
             if let Some(&keycode) = self.key_to_keycode.get(&ch_lower.to_string()) {
                 let need_shift = ch.is_ascii_uppercase();
@@ -665,6 +717,7 @@ fn run(args: Args) -> Result<()> {
                         keyboard,
                         delay,
                         xkb_config.clone(),
+                        args.layout_index,
                     );
 
                     // Setup keymap (from EI server, CLI/env config, or system default)

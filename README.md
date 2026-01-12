@@ -120,7 +120,23 @@ eitype -l us --variant dvorak "Hello"
 
 # Full XKB configuration
 eitype -l us --variant dvorak --model pc104 --options "ctrl:nocaps" "Hello"
+
+# Select a specific layout index when multiple layouts are available
+eitype --layout-index 1 "Hello"
 ```
+
+### Multi-Layout Keymaps
+
+When the EI server provides a keymap with multiple layouts (e.g., Dvorak + QWERTY), eitype uses layout index 0 by default. This is typically correct since layout 0 is the first/active layout.
+
+If you need to use a different layout, specify it with `--layout-index`:
+
+```bash
+# Use the second layout (index 1)
+eitype --layout-index 1 -p "Hello"
+```
+
+Use `-vv` to see all available layouts in the keymap.
 
 ### Environment Variables
 
@@ -143,4 +159,4 @@ XKB_DEFAULT_LAYOUT=de eitype -l fr "Bonjour"  # Uses French layout
 
 ## License
 
-MIT
+Apache 2
