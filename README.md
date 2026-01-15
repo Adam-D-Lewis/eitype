@@ -16,19 +16,43 @@ A library and CLI tool for typing text using the Emulated Input (EI) protocol on
 
 ## Installation
 
-### CLI
+### Using pixi (recommended)
+
+Pixi handles all dependencies (including libxkbcommon) automatically:
+
+```bash
+# Build and install Python bindings
+pixi run build
+
+# Install CLI
+pixi run install-cli
+
+# Run tests
+pixi run test
+```
+
+### Manual Installation
+
+#### System Dependencies
+
+If not using pixi, install the required system libraries first:
+
+| Distribution | Command |
+|--------------|---------|
+| Debian/Ubuntu | `sudo apt install libxkbcommon-dev` |
+| Fedora/RHEL | `sudo dnf install libxkbcommon-devel` |
+| Arch Linux | `sudo pacman -S libxkbcommon` |
+| openSUSE | `sudo zypper install libxkbcommon-devel` |
+
+#### CLI
 
 ```bash
 cargo install --path .
 ```
 
-### Python
+#### Python
 
 ```bash
-# Using pixi (recommended)
-pixi run build
-
-# Or using maturin directly
 pip install maturin
 maturin develop --features python
 ```
@@ -246,23 +270,21 @@ fn main() -> Result<(), EiTypeError> {
 }
 ```
 
-## Building from Source
+## Development
 
-### System Dependencies
+```bash
+# Set up dev environment with pre-commit hooks
+pixi run -e dev install-hooks
 
-Before building eitype, install the required system libraries:
+# Run linting (cargo fmt + clippy)
+pixi run -e dev lint
+```
 
-| Distribution | Command |
-|--------------|---------|
-| Debian/Ubuntu | `sudo apt install libxkbcommon-dev` |
-| Fedora/RHEL | `sudo dnf install libxkbcommon-devel` |
-| Arch Linux | `sudo pacman -S libxkbcommon` |
-| openSUSE | `sudo zypper install libxkbcommon-devel` |
-
-### Build Requirements
+## Requirements
 
 - Rust 1.70+
 - Python 3.10+ (only for Python bindings)
+- libxkbcommon (handled automatically by pixi, or install manually)
 
 ## License
 
