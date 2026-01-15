@@ -20,3 +20,15 @@ install-cli = "cargo install --path ."
 python = ">=3.10,<3.14"
 maturin = ">=1.0"
 pip = "*"
+libxkbcommon = "*"
+pkg-config = "*"
+
+[feature.dev.dependencies]
+pre-commit = "*"
+
+[feature.dev.tasks]
+lint = "pre-commit run --all-files"
+install-hooks = "pre-commit install"
+
+[environments]
+dev = ["dev"]

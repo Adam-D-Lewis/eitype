@@ -125,7 +125,10 @@ impl EiTypeConfig {
 
     /// Check if any XKB configuration is specified
     fn is_specified(&self) -> bool {
-        self.layout.is_some() || self.variant.is_some() || self.model.is_some() || self.options.is_some()
+        self.layout.is_some()
+            || self.variant.is_some()
+            || self.model.is_some()
+            || self.options.is_some()
     }
 }
 
@@ -215,7 +218,10 @@ fn build_key_to_keycode_map() -> HashMap<String, u32> {
 
     // Letter keys
     let letters = "abcdefghijklmnopqrstuvwxyz";
-    let letter_codes = [30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47, 17, 45, 21, 44];
+    let letter_codes = [
+        30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47, 17,
+        45, 21, 44,
+    ];
     for (ch, code) in letters.chars().zip(letter_codes.iter()) {
         map.insert(ch.to_string(), *code);
     }
@@ -224,7 +230,11 @@ fn build_key_to_keycode_map() -> HashMap<String, u32> {
 }
 
 /// Find the keycode for a character, and whether shift is needed
-fn find_keycode_for_char(ch: char, keymap: &xkb::Keymap, layout_index: u32) -> Result<(u32, bool), EiTypeError> {
+fn find_keycode_for_char(
+    ch: char,
+    keymap: &xkb::Keymap,
+    layout_index: u32,
+) -> Result<(u32, bool), EiTypeError> {
     let min_keycode: u32 = keymap.min_keycode().into();
     let max_keycode: u32 = keymap.max_keycode().into();
 
@@ -287,7 +297,9 @@ fn get_timestamp() -> u64 {
 
 /// Connect to EI via the XDG RemoteDesktop portal.
 /// Returns the stream and optionally a new restore token for future sessions.
-fn connect_via_portal(restore_token: Option<&str>) -> Result<(UnixStream, Option<String>), EiTypeError> {
+fn connect_via_portal(
+    restore_token: Option<&str>,
+) -> Result<(UnixStream, Option<String>), EiTypeError> {
     use ashpd::desktop::remote_desktop::{DeviceType, RemoteDesktop};
     use ashpd::desktop::PersistMode;
 
@@ -302,34 +314,47 @@ fn connect_via_portal(restore_token: Option<&str>) -> Result<(UnixStream, Option
         .map_err(|e| EiTypeError::Connection(format!("Failed to create Tokio runtime: {}", e)))?;
 
     rt.block_on(async {
-        let proxy = RemoteDesktop::new().await
-            .map_err(|e| EiTypeError::Connection(format!("Failed to create RemoteDesktop proxy: {}", e)))?;
+        let proxy = RemoteDesktop::new().await.map_err(|e| {
+            EiTypeError::Connection(format!("Failed to create RemoteDesktop proxy: {}", e))
+        })?;
 
-        let session = proxy.create_session().await
+        let session = proxy
+            .create_session()
+            .await
             .map_err(|e| EiTypeError::Connection(format!("Failed to create session: {}", e)))?;
 
-        proxy.select_devices(
-            &session,
-            DeviceType::Keyboard.into(),
-            restore_token,
-            PersistMode::ExplicitlyRevoked,
-        ).await.map_err(|e| EiTypeError::Connection(format!("Failed to select devices: {}", e)))?;
+        proxy
+            .select_devices(
+                &session,
+                DeviceType::Keyboard.into(),
+                restore_token,
+                PersistMode::ExplicitlyRevoked,
+            )
+            .await
+            .map_err(|e| EiTypeError::Connection(format!("Failed to select devices: {}", e)))?;
 
-        let response = proxy.start(&session, None).await
+        let response = proxy
+            .start(&session, None)
+            .await
             .map_err(|e| EiTypeError::Connection(format!("Failed to start session: {}", e)))?
             .response()
-            .map_err(|e| EiTypeError::Connection(format!("Failed to get session response: {}", e)))?;
+            .map_err(|e| {
+                EiTypeError::Connection(format!("Failed to get session response: {}", e))
+            })?;
 
         let new_token = response.restore_token().map(|s| s.to_string());
         if new_token.is_some() {
             debug!("Received new restore token from portal");
         }
 
-        let fd = proxy.connect_to_eis(&session).await
+        let fd = proxy
+            .connect_to_eis(&session)
+            .await
             .map_err(|e| EiTypeError::Connection(format!("Failed to connect to EIS: {}", e)))?;
 
         let stream = UnixStream::from(fd);
-        stream.set_nonblocking(true)
+        stream
+            .set_nonblocking(true)
             .map_err(|e| EiTypeError::Connection(format!("Failed to set non-blocking: {}", e)))?;
 
         Ok((stream, new_token))
@@ -340,10 +365,12 @@ fn connect_via_portal(restore_token: Option<&str>) -> Result<(UnixStream, Option
 fn connect_via_socket(path: &Path) -> Result<UnixStream, EiTypeError> {
     info!("Connecting to socket: {:?}", path);
 
-    let stream = UnixStream::connect(path)
-        .map_err(|e| EiTypeError::Connection(format!("Failed to connect to socket {:?}: {}", path, e)))?;
+    let stream = UnixStream::connect(path).map_err(|e| {
+        EiTypeError::Connection(format!("Failed to connect to socket {:?}: {}", path, e))
+    })?;
 
-    stream.set_nonblocking(true)
+    stream
+        .set_nonblocking(true)
         .map_err(|e| EiTypeError::Connection(format!("Failed to set non-blocking: {}", e)))?;
 
     Ok(stream)
@@ -400,7 +427,8 @@ impl EiType {
             .map_err(|e| EiTypeError::Connection(format!("Failed to create EI context: {}", e)))?;
 
         info!("Performing handshake...");
-        let (connection, mut event_iter) = context.handshake_blocking("eitype", ContextType::Sender)
+        let (connection, mut event_iter) = context
+            .handshake_blocking("eitype", ContextType::Sender)
             .map_err(|e| EiTypeError::Connection(format!("Handshake failed: {}", e)))?;
 
         info!("Connected! Waiting for devices...");
@@ -418,14 +446,18 @@ impl EiType {
                     let reason = disconnected.reason;
                     let explanation = &disconnected.explanation;
                     error!("Disconnected: {:?} - {}", reason, explanation);
-                    return Err(EiTypeError::Connection("Disconnected from EI server".to_string()));
+                    return Err(EiTypeError::Connection(
+                        "Disconnected from EI server".to_string(),
+                    ));
                 }
 
                 EiEvent::SeatAdded(seat_added) => {
                     let seat = &seat_added.seat;
                     debug!("Seat added: {:?}", seat.name());
                     seat.bind_capabilities(&[DeviceCapability::Keyboard]);
-                    connection.flush().map_err(|e| EiTypeError::Connection(e.to_string()))?;
+                    connection
+                        .flush()
+                        .map_err(|e| EiTypeError::Connection(e.to_string()))?;
                 }
 
                 EiEvent::DeviceAdded(device_added) => {
@@ -494,8 +526,16 @@ impl EiType {
 
             info!(
                 "Loading keymap from configuration: layout={}, variant={}, model={}",
-                if layout.is_empty() { "(default)" } else { layout },
-                if variant.is_empty() { "(none)" } else { variant },
+                if layout.is_empty() {
+                    "(default)"
+                } else {
+                    layout
+                },
+                if variant.is_empty() {
+                    "(none)"
+                } else {
+                    variant
+                },
                 if model.is_empty() { "(default)" } else { model }
             );
 
@@ -508,7 +548,9 @@ impl EiType {
                 options,
                 xkb::KEYMAP_COMPILE_NO_FLAGS,
             )
-            .ok_or_else(|| EiTypeError::Keymap("Failed to load keymap from configuration".to_string()))?;
+            .ok_or_else(|| {
+                EiTypeError::Keymap("Failed to load keymap from configuration".to_string())
+            })?;
 
             let state = xkb::State::new(&keymap);
             self.keymap = Some(keymap);
@@ -520,8 +562,9 @@ impl EiType {
         if let Some(keymap_info) = self.device.keymap() {
             use std::os::fd::FromRawFd;
             use std::os::fd::IntoRawFd;
-            let fd_dup = rustix::io::dup(&keymap_info.fd)
-                .map_err(|e| EiTypeError::Keymap(format!("Failed to duplicate keymap fd: {}", e)))?;
+            let fd_dup = rustix::io::dup(&keymap_info.fd).map_err(|e| {
+                EiTypeError::Keymap(format!("Failed to duplicate keymap fd: {}", e))
+            })?;
             let owned_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd_dup.into_raw_fd()) };
 
             let keymap = unsafe {
@@ -543,8 +586,7 @@ impl EiType {
                 let layout_name = keymap.layout_get_name(0);
                 info!(
                     "Keymap loaded from EI server: layout=\"{}\" ({} layout(s) available)",
-                    layout_name,
-                    num_layouts
+                    layout_name, num_layouts
                 );
                 for i in 0..num_layouts {
                     debug!("  Layout {}: \"{}\"", i, keymap.layout_get_name(i));
@@ -583,14 +625,18 @@ impl EiType {
         let serial = self.connection.serial();
         self.device.device().start_emulating(serial, self.sequence);
         self.sequence += 1;
-        self.connection.flush().map_err(|e| EiTypeError::Typing(e.to_string()))?;
+        self.connection
+            .flush()
+            .map_err(|e| EiTypeError::Typing(e.to_string()))?;
         Ok(())
     }
 
     fn stop_emulating(&mut self) -> Result<(), EiTypeError> {
         let serial = self.connection.serial();
         self.device.device().stop_emulating(serial);
-        self.connection.flush().map_err(|e| EiTypeError::Typing(e.to_string()))?;
+        self.connection
+            .flush()
+            .map_err(|e| EiTypeError::Typing(e.to_string()))?;
         Ok(())
     }
 
@@ -598,7 +644,9 @@ impl EiType {
         let serial = self.connection.serial();
         let timestamp = get_timestamp();
         self.device.device().frame(serial, timestamp);
-        self.connection.flush().map_err(|e| EiTypeError::Typing(e.to_string()))?;
+        self.connection
+            .flush()
+            .map_err(|e| EiTypeError::Typing(e.to_string()))?;
         Ok(())
     }
 
@@ -682,7 +730,8 @@ impl EiType {
 
     /// Press and release a special key (e.g., "Return", "Tab", "Escape")
     pub fn press_key(&self, key_name: &str) -> Result<(), EiTypeError> {
-        let keycode = self.key_to_keycode
+        let keycode = self
+            .key_to_keycode
             .get(&key_name.to_lowercase())
             .copied()
             .ok_or_else(|| EiTypeError::UnknownKey(key_name.to_string()))?;
@@ -693,7 +742,8 @@ impl EiType {
 
     /// Hold a modifier key (will be released when release_modifiers is called)
     pub fn hold_modifier(&mut self, mod_name: &str) -> Result<(), EiTypeError> {
-        let keycode = self.key_to_keycode
+        let keycode = self
+            .key_to_keycode
             .get(&mod_name.to_lowercase())
             .copied()
             .ok_or_else(|| EiTypeError::UnknownKey(mod_name.to_string()))?;
@@ -706,7 +756,8 @@ impl EiType {
 
     /// Press and release a modifier key (like a regular key press)
     pub fn press_modifier(&self, mod_name: &str) -> Result<(), EiTypeError> {
-        let keycode = self.key_to_keycode
+        let keycode = self
+            .key_to_keycode
             .get(&mod_name.to_lowercase())
             .copied()
             .ok_or_else(|| EiTypeError::UnknownKey(mod_name.to_string()))?;
@@ -773,7 +824,8 @@ impl EiType {
     #[pyo3(signature = (config=None))]
     fn py_connect_portal(config: Option<EiTypeConfig>) -> PyResult<Self> {
         let config = config.unwrap_or_default();
-        Self::connect_portal(config).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        Self::connect_portal(config)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Connect via the XDG RemoteDesktop portal with token support
@@ -800,31 +852,36 @@ impl EiType {
     /// Type a string of text
     #[pyo3(name = "type_text")]
     fn py_type_text(&self, text: &str) -> PyResult<()> {
-        self.type_text(text).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        self.type_text(text)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Press and release a special key
     #[pyo3(name = "press_key")]
     fn py_press_key(&self, key_name: &str) -> PyResult<()> {
-        self.press_key(key_name).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        self.press_key(key_name)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Hold a modifier key
     #[pyo3(name = "hold_modifier")]
     fn py_hold_modifier(&mut self, mod_name: &str) -> PyResult<()> {
-        self.hold_modifier(mod_name).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        self.hold_modifier(mod_name)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Press and release a modifier key
     #[pyo3(name = "press_modifier")]
     fn py_press_modifier(&self, mod_name: &str) -> PyResult<()> {
-        self.press_modifier(mod_name).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        self.press_modifier(mod_name)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Release all held modifiers
     #[pyo3(name = "release_modifiers")]
     fn py_release_modifiers(&mut self) -> PyResult<()> {
-        self.release_modifiers().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        self.release_modifiers()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 }
 

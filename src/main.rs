@@ -127,10 +127,22 @@ impl Args {
     /// Convert CLI args to EiTypeConfig
     fn to_config(&self) -> EiTypeConfig {
         EiTypeConfig {
-            layout: self.layout.clone().or_else(|| std::env::var("XKB_DEFAULT_LAYOUT").ok()),
-            variant: self.variant.clone().or_else(|| std::env::var("XKB_DEFAULT_VARIANT").ok()),
-            model: self.model.clone().or_else(|| std::env::var("XKB_DEFAULT_MODEL").ok()),
-            options: self.options.clone().or_else(|| std::env::var("XKB_DEFAULT_OPTIONS").ok()),
+            layout: self
+                .layout
+                .clone()
+                .or_else(|| std::env::var("XKB_DEFAULT_LAYOUT").ok()),
+            variant: self
+                .variant
+                .clone()
+                .or_else(|| std::env::var("XKB_DEFAULT_VARIANT").ok()),
+            model: self
+                .model
+                .clone()
+                .or_else(|| std::env::var("XKB_DEFAULT_MODEL").ok()),
+            options: self
+                .options
+                .clone()
+                .or_else(|| std::env::var("XKB_DEFAULT_OPTIONS").ok()),
             layout_index: self.layout_index,
             delay_ms: self.delay,
         }
@@ -207,7 +219,8 @@ fn run(args: Args) -> Result<()> {
             load_restore_token()
         };
 
-        let (eitype, new_token) = EiType::connect_portal_with_token(config, saved_token.as_deref())?;
+        let (eitype, new_token) =
+            EiType::connect_portal_with_token(config, saved_token.as_deref())?;
 
         // Save new token for future runs
         if let Some(token) = new_token {
@@ -316,12 +329,17 @@ mod tests {
     fn test_cli_parsing_full_xkb_config() {
         let args = Args::try_parse_from([
             "eitype",
-            "-l", "us",
-            "--variant", "dvorak",
-            "--model", "pc104",
-            "--options", "ctrl:nocaps",
-            "hello"
-        ]).unwrap();
+            "-l",
+            "us",
+            "--variant",
+            "dvorak",
+            "--model",
+            "pc104",
+            "--options",
+            "ctrl:nocaps",
+            "hello",
+        ])
+        .unwrap();
         assert_eq!(args.layout, Some("us".to_string()));
         assert_eq!(args.variant, Some("dvorak".to_string()));
         assert_eq!(args.model, Some("pc104".to_string()));
@@ -332,11 +350,15 @@ mod tests {
     fn test_to_config() {
         let args = Args::try_parse_from([
             "eitype",
-            "-l", "de",
-            "--variant", "nodeadkeys",
-            "-d", "50",
-            "hello"
-        ]).unwrap();
+            "-l",
+            "de",
+            "--variant",
+            "nodeadkeys",
+            "-d",
+            "50",
+            "hello",
+        ])
+        .unwrap();
 
         let config = args.to_config();
         assert_eq!(config.layout, Some("de".to_string()));
@@ -347,12 +369,9 @@ mod tests {
     #[test]
     fn test_to_actions() {
         let args = Args::try_parse_from([
-            "eitype",
-            "-M", "ctrl",
-            "hello",
-            "-k", "return",
-            "-P", "shift"
-        ]).unwrap();
+            "eitype", "-M", "ctrl", "hello", "-k", "return", "-P", "shift",
+        ])
+        .unwrap();
 
         let actions = args.to_actions();
         assert_eq!(actions.len(), 4);
