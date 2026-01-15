@@ -1,6 +1,6 @@
 # eitype
 
-A wtype-like CLI tool for typing text using Emulated Input (EI) protocol on Wayland.
+A library and CLI tool for typing text using the Emulated Input (EI) protocol on Wayland.
 
 ## Features
 
@@ -11,17 +11,33 @@ A wtype-like CLI tool for typing text using Emulated Input (EI) protocol on Wayl
 - Direct socket connection support
 - Configurable delay between key events
 - Keyboard layout configuration via CLI or environment variables
+- **Python bindings** for use in Python applications
+- **Rust library** for integration into other Rust projects
 
 ## Installation
 
+### CLI
+
 ```bash
 cargo install --path .
+```
+
+### Python
+
+```bash
+# Using pixi (recommended)
+pixi run build
+
+# Or using maturin directly
+pip install maturin
+maturin develop --features python
 ```
 
 ### Dependencies
 
 - libxkbcommon (libxkbcommon-dev on Debian/Ubuntu)
 - Rust 1.70+
+- Python 3.10+ (for Python bindings)
 
 ## Usage
 
@@ -168,6 +184,74 @@ eitype "Hallo"
 XKB_DEFAULT_LAYOUT=de eitype -l fr "Bonjour"  # Uses French layout
 ```
 
+## Python Usage
+
+```python
+from eitype import EiType, EiTypeConfig
+
+# Simple connection via portal
+typer = EiType.connect_portal()
+typer.type_text("Hello from Python!")
+typer.press_key("Return")
+
+# With custom configuration
+config = EiTypeConfig(layout="de", delay_ms=10)
+typer = EiType.connect_portal(config)
+typer.type_text("Hallo Welt!")
+
+# Modifier keys
+typer.hold_modifier("ctrl")
+typer.press_key("c")
+typer.release_modifiers()
+```
+
+### Token Persistence (for long-running apps)
+
+For applications that run continuously (like voice typing tools), you can save and reuse the portal authorization token:
+
+```python
+from eitype import EiType
+
+# First run - will show authorization dialog
+typer, token = EiType.connect_portal_with_token()
+if token:
+    save_to_config(token)  # Save for next time
+
+# Subsequent runs - no dialog needed
+saved_token = load_from_config()
+typer, _ = EiType.connect_portal_with_token(saved_token)
+typer.type_text("No dialog this time!")
+```
+
+## Rust Library Usage
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+eitype = { path = "../eitype" }  # or from crates.io when published
+```
+
+```rust
+use eitype::{EiType, EiTypeConfig, EiTypeError};
+
+fn main() -> Result<(), EiTypeError> {
+    // Connect via portal
+    let mut typer = EiType::connect_portal(EiTypeConfig::default())?;
+
+    // Type text
+    typer.type_text("Hello from Rust!")?;
+    typer.press_key("Return")?;
+
+    // With modifiers
+    typer.hold_modifier("ctrl")?;
+    typer.press_key("c")?;
+    typer.release_modifiers()?;
+
+    Ok(())
+}
+```
+
 ## License
 
-Apache 2
+Apache 2.0

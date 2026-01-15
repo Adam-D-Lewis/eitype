@@ -2,12 +2,20 @@
 name = "eitype"
 version = "0.1.0"
 edition = "2021"
-description = "A wtype-like CLI tool for typing text using Emulated Input (EI) protocol on Wayland"
+description = "A wtype-like CLI tool and library for typing text using Emulated Input (EI) protocol on Wayland"
 license = "Apache-2.0"
 authors = ["eitype contributors"]
 repository = "https://github.com/Adam-D-Lewis/eitype"
 keywords = ["wayland", "input", "keyboard", "ei", "libei"]
-categories = ["command-line-utilities"]
+categories = ["command-line-utilities", "api-bindings"]
+
+[lib]
+name = "eitype"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "eitype"
+path = "src/main.rs"
 
 [dependencies]
 # EI protocol implementation
@@ -19,7 +27,7 @@ calloop = "0.14"
 # XKB for keycode mapping
 xkbcommon = "0.9"
 
-# CLI argument parsing
+# CLI argument parsing (only needed for binary)
 clap = { version = "4", features = ["derive"] }
 
 # Error handling
@@ -36,6 +44,13 @@ rustix = { version = "1", features = ["fs"] }
 # Logging
 log = "0.4"
 env_logger = "0.11"
+
+# Python bindings (optional)
+pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
+
+[features]
+default = []
+python = ["pyo3"]
 
 [profile.release]
 lto = true

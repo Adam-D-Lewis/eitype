@@ -1,0 +1,22 @@
+[project]
+name = "eitype"
+version = "0.1.0"
+description = "Type text on Wayland using the Emulated Input (EI) protocol"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[tasks]
+# Development tasks
+build = "maturin develop"
+build-release = "maturin develop --release"
+test = "cargo test"
+test-python = { cmd = "python -c 'import eitype; print(dir(eitype))'", depends-on = ["build"] }
+
+# CLI tasks
+run = "cargo run --"
+install-cli = "cargo install --path ."
+
+[dependencies]
+python = ">=3.10,<3.14"
+maturin = ">=1.0"
+pip = "*"
