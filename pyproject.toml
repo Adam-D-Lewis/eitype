@@ -34,3 +34,4 @@ Repository = "https://github.com/Adam-D-Lewis/eitype"
 features = ["python"]
 python-source = "python"
 module-name = "eitype"
+binaries = true
