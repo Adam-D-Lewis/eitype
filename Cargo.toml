@@ -52,6 +52,9 @@ pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
 default = []
 python = ["pyo3"]
 
+[build-dependencies]
+pkg-config = "0.3"
+
 [profile.release]
 lto = true
 strip = true

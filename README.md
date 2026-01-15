@@ -33,12 +33,6 @@ pip install maturin
 maturin develop --features python
 ```
 
-### Dependencies
-
-- libxkbcommon (libxkbcommon-dev on Debian/Ubuntu)
-- Rust 1.70+
-- Python 3.10+ (for Python bindings)
-
 ## Usage
 
 ```bash
@@ -251,6 +245,24 @@ fn main() -> Result<(), EiTypeError> {
     Ok(())
 }
 ```
+
+## Building from Source
+
+### System Dependencies
+
+Before building eitype, install the required system libraries:
+
+| Distribution | Command |
+|--------------|---------|
+| Debian/Ubuntu | `sudo apt install libxkbcommon-dev` |
+| Fedora/RHEL | `sudo dnf install libxkbcommon-devel` |
+| Arch Linux | `sudo pacman -S libxkbcommon` |
+| openSUSE | `sudo zypper install libxkbcommon-devel` |
+
+### Build Requirements
+
+- Rust 1.70+
+- Python 3.10+ (only for Python bindings)
 
 ## License
 
