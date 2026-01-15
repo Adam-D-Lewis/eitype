@@ -25,12 +25,28 @@ use reis::event::{DeviceCapability, EiEvent};
 use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use xkbcommon::xkb;
 
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
+
+/// Global tokio runtime for portal connections.
+/// Using a single runtime avoids issues with zbus/DBus connection state
+/// being left in a bad state when a runtime is dropped.
+static TOKIO_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+fn get_tokio_runtime() -> &'static tokio::runtime::Runtime {
+    TOKIO_RUNTIME.get_or_init(|| {
+        debug!("Creating global tokio runtime for portal connections");
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime")
+    })
+}
 
 // ============================================================================
 // Error Types
@@ -308,10 +324,10 @@ fn connect_via_portal(
         info!("Using saved restore token for session persistence");
     }
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| EiTypeError::Connection(format!("Failed to create Tokio runtime: {}", e)))?;
+    // Use global runtime to avoid DBus connection issues when runtime is dropped.
+    // Creating a new runtime per connection causes zbus to leave stale state
+    // that blocks subsequent connections.
+    let rt = get_tokio_runtime();
 
     rt.block_on(async {
         let proxy = RemoteDesktop::new().await.map_err(|e| {
@@ -393,6 +409,8 @@ pub struct EiType {
     held_modifiers: Vec<u32>,
     sequence: u32,
     layout_index: u32,
+    /// Track whether close() has been called to avoid double-close
+    closed: bool,
 }
 
 impl EiType {
@@ -503,6 +521,7 @@ impl EiType {
             held_modifiers: Vec::new(),
             sequence: 1,
             layout_index: config.layout_index,
+            closed: false,
         };
 
         // Setup keymap
@@ -801,14 +820,44 @@ impl EiType {
 
         Ok(())
     }
+
+    /// Explicitly close the connection and release all resources.
+    ///
+    /// This method should be called when you're done with the EiType instance,
+    /// especially before attempting to create a new connection. While the Drop
+    /// implementation will clean up automatically, calling close() explicitly
+    /// ensures proper cleanup and avoids potential issues with reconnection.
+    ///
+    /// After calling close(), this instance should not be used anymore.
+    pub fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+
+        debug!("Closing EiType connection");
+
+        // Release any held modifiers
+        let _ = self.release_modifiers();
+
+        // Stop emulating
+        let _ = self.stop_emulating();
+
+        // Send disconnect request to the EI server
+        // This tells the server we're intentionally disconnecting
+        self.connection.connection().disconnect();
+
+        // Flush to ensure the disconnect message is sent
+        let _ = self.connection.flush();
+
+        debug!("EiType connection closed");
+    }
 }
 
 impl Drop for EiType {
     fn drop(&mut self) {
-        // Release any held modifiers
-        let _ = self.release_modifiers();
-        // Stop emulating
-        let _ = self.stop_emulating();
+        // Use close() which handles all cleanup including EI disconnect
+        self.close();
     }
 }
 
@@ -882,6 +931,43 @@ impl EiType {
     fn py_release_modifiers(&mut self) -> PyResult<()> {
         self.release_modifiers()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Close the connection and release all resources.
+    ///
+    /// This method should be called when you're done with the EiType instance,
+    /// especially before attempting to create a new connection. While the
+    /// destructor will clean up automatically, calling close() explicitly
+    /// ensures proper cleanup and avoids potential issues with reconnection.
+    ///
+    /// After calling close(), this instance should not be used anymore.
+    #[pyo3(name = "close")]
+    fn py_close(&mut self) {
+        self.close();
+    }
+
+    /// Context manager entry - returns self for use with `with` statement.
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// Context manager exit - closes the connection.
+    ///
+    /// This ensures proper cleanup when used with `with` statements:
+    /// ```python
+    /// with EiType.connect_portal() as typer:
+    ///     typer.type_text("Hello!")
+    /// # Connection is automatically closed here
+    /// ```
+    #[pyo3(signature = (_exc_type=None, _exc_value=None, _traceback=None))]
+    fn __exit__(
+        &mut self,
+        _exc_type: Option<&Bound<'_, PyAny>>,
+        _exc_value: Option<&Bound<'_, PyAny>>,
+        _traceback: Option<&Bound<'_, PyAny>>,
+    ) -> bool {
+        self.close();
+        false // Don't suppress exceptions
     }
 }
 

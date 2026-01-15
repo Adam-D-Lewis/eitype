@@ -26,6 +26,9 @@ pkg-config = "*"
 [feature.dev.dependencies]
 pre-commit = "*"
 
+[feature.dev.pypi-dependencies]
+eitype = { path = ".", editable = true }
+
 [feature.dev.tasks]
 lint = "pre-commit run --all-files"
 install-hooks = "pre-commit install"

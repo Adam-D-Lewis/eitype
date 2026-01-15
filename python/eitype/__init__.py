@@ -9,11 +9,20 @@ Example:
     >>> typer = EiType.connect_portal()
     >>> typer.type_text("Hello, world!")
     >>> typer.press_key("Return")
+    >>> typer.close()  # Explicitly close when done
+
+Using as a context manager (recommended):
+    >>> with EiType.connect_portal() as typer:
+    ...     typer.type_text("Hello, world!")
+    ...     typer.press_key("Return")
+    ... # Connection is automatically closed
 
 For long-running applications (like voiceType), use token-based connections:
     >>> typer, token = EiType.connect_portal_with_token(saved_token)
     >>> if token:
     ...     save_token_to_config(token)  # Persist for next run
+    >>> # ... use typer ...
+    >>> typer.close()  # Important: close before reconnecting
 """
 
 from __future__ import annotations
@@ -99,10 +108,16 @@ class EiType:
     This class provides methods to connect to an EI server (via portal or socket)
     and emulate keyboard input.
 
-    Example:
+    The returned connection object supports context managers for automatic cleanup:
+        >>> with EiType.connect_portal() as typer:
+        ...     typer.type_text("Hello!")
+        ...     typer.press_key("Return")
+        ... # Connection automatically closed
+
+    Or manually close when done:
         >>> typer = EiType.connect_portal()
         >>> typer.type_text("Hello!")
-        >>> typer.press_key("Return")
+        >>> typer.close()  # Important: call close() before reconnecting
     """
 
     @staticmethod
