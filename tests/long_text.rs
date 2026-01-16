@@ -26,8 +26,7 @@ use eitype::{EiType, EiTypeConfig};
 #[test]
 fn test_type_500_chars() {
     // Generate 500+ characters of test text
-    let test_text = "The quick brown fox jumps over the lazy dog. "
-        .repeat(15); // 45 chars * 15 = 675 characters
+    let test_text = "The quick brown fox jumps over the lazy dog. ".repeat(15); // 45 chars * 15 = 675 characters
 
     assert!(
         test_text.len() >= 500,
@@ -36,8 +35,8 @@ fn test_type_500_chars() {
     );
 
     println!("Connecting to portal...");
-    let typer = EiType::connect_portal(EiTypeConfig::default())
-        .expect("Failed to connect to portal");
+    let typer =
+        EiType::connect_portal(EiTypeConfig::default()).expect("Failed to connect to portal");
 
     println!("Typing {} characters...", test_text.len());
     typer
@@ -50,8 +49,7 @@ fn test_type_500_chars() {
 /// Test typing 1000+ characters - a more strenuous test.
 #[test]
 fn test_type_1000_chars() {
-    let test_text = "abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789 "
-        .repeat(20); // 66 chars * 20 = 1320 characters
+    let test_text = "abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789 ".repeat(20); // 66 chars * 20 = 1320 characters
 
     assert!(
         test_text.len() >= 1000,
@@ -60,8 +58,8 @@ fn test_type_1000_chars() {
     );
 
     println!("Connecting to portal...");
-    let typer = EiType::connect_portal(EiTypeConfig::default())
-        .expect("Failed to connect to portal");
+    let typer =
+        EiType::connect_portal(EiTypeConfig::default()).expect("Failed to connect to portal");
 
     println!("Typing {} characters...", test_text.len());
     typer
@@ -103,10 +101,13 @@ fn test_type_transcription_length() {
     );
 
     println!("Connecting to portal...");
-    let typer = EiType::connect_portal(EiTypeConfig::default())
-        .expect("Failed to connect to portal");
+    let typer =
+        EiType::connect_portal(EiTypeConfig::default()).expect("Failed to connect to portal");
 
-    println!("Typing {} characters (transcription-length test)...", test_text.len());
+    println!(
+        "Typing {} characters (transcription-length test)...",
+        test_text.len()
+    );
     typer
         .type_text(test_text)
         .expect("Failed to type transcription-length text - EAGAIN retry may have failed");
