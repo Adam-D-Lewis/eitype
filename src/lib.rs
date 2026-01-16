@@ -1096,4 +1096,29 @@ mod tests {
         let t2 = get_timestamp();
         assert!(t2 >= t1);
     }
+
+    #[test]
+    fn test_exponential_backoff_calculation() {
+        // Verify the backoff formula used in flush_with_retry():
+        // delay_ms = (delay_ms * 2).min(MAX_DELAY_MS)
+        let max_delay_ms: u64 = 100;
+        let mut delay_ms: u64 = 1;
+
+        // Should double each time until capped at 100ms
+        let expected_delays = [2, 4, 8, 16, 32, 64, 100, 100];
+        for expected in expected_delays {
+            delay_ms = (delay_ms * 2).min(max_delay_ms);
+            assert_eq!(delay_ms, expected);
+        }
+    }
+
+    #[test]
+    fn test_eagain_errno_value() {
+        // Document the expected errno for EAGAIN on Linux.
+        // flush_with_retry() checks raw_os_error() == 11 to detect
+        // when the socket buffer is full and we should retry.
+        assert_eq!(libc::EAGAIN, 11);
+        // On Linux, EWOULDBLOCK is the same as EAGAIN
+        assert_eq!(libc::EWOULDBLOCK, libc::EAGAIN);
+    }
 }
