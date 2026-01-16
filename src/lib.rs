@@ -663,10 +663,59 @@ impl EiType {
         let serial = self.connection.serial();
         let timestamp = get_timestamp();
         self.device.device().frame(serial, timestamp);
-        self.connection
-            .flush()
-            .map_err(|e| EiTypeError::Typing(e.to_string()))?;
-        Ok(())
+        self.flush_with_retry()
+    }
+
+    /// Flush the connection with retry logic for EAGAIN (WouldBlock) errors.
+    ///
+    /// When the socket buffer is full (common with long text input), flush()
+    /// returns EAGAIN. Instead of failing immediately, we wait for the buffer
+    /// to drain and retry.
+    fn flush_with_retry(&self) -> Result<(), EiTypeError> {
+        const MAX_RETRIES: u32 = 50;
+        const INITIAL_DELAY_MS: u64 = 1;
+        const MAX_DELAY_MS: u64 = 100;
+
+        let mut retries = 0;
+        let mut delay_ms = INITIAL_DELAY_MS;
+
+        loop {
+            match self.connection.flush() {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    // Check if this is EAGAIN/EWOULDBLOCK (errno 11 on Linux)
+                    // Use raw_os_error() to avoid rustix version mismatch issues
+                    // (reis uses a different rustix version than our direct dependency)
+                    let raw_errno = e.raw_os_error();
+                    let is_would_block = raw_errno == 11; // EAGAIN == EWOULDBLOCK on Linux
+
+                    if !is_would_block {
+                        // Not a recoverable error, fail immediately
+                        return Err(EiTypeError::Typing(e.to_string()));
+                    }
+
+                    retries += 1;
+                    if retries > MAX_RETRIES {
+                        return Err(EiTypeError::Typing(format!(
+                            "Socket buffer full after {} retries: {}",
+                            MAX_RETRIES, e
+                        )));
+                    }
+
+                    trace!(
+                        "Socket buffer full (EAGAIN), waiting {}ms before retry {}/{}",
+                        delay_ms,
+                        retries,
+                        MAX_RETRIES
+                    );
+
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+
+                    // Exponential backoff with cap
+                    delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
+                }
+            }
+        }
     }
 
     fn press_key_internal(&self, keycode: u32) -> Result<(), EiTypeError> {
