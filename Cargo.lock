@@ -242,6 +242,7 @@ dependencies = [
  "calloop",
  "clap",
  "env_logger",
+ "libc",
  "log",
  "pkg-config",
  "pyo3",

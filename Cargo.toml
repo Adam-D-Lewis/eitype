@@ -51,6 +51,11 @@ pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
 [features]
 default = []
 python = ["pyo3"]
+# Enable integration tests that require a Wayland desktop with EI support
+wayland-integration-tests = []
+
+[dev-dependencies]
+libc = "0.2"
 
 [build-dependencies]
 pkg-config = "0.3"
