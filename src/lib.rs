@@ -644,19 +644,13 @@ impl EiType {
         let serial = self.connection.serial();
         self.device.device().start_emulating(serial, self.sequence);
         self.sequence += 1;
-        self.connection
-            .flush()
-            .map_err(|e| EiTypeError::Typing(e.to_string()))?;
-        Ok(())
+        self.flush_with_retry()
     }
 
     fn stop_emulating(&mut self) -> Result<(), EiTypeError> {
         let serial = self.connection.serial();
         self.device.device().stop_emulating(serial);
-        self.connection
-            .flush()
-            .map_err(|e| EiTypeError::Typing(e.to_string()))?;
-        Ok(())
+        self.flush_with_retry()
     }
 
     fn send_frame(&self) -> Result<(), EiTypeError> {
