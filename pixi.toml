@@ -18,13 +18,14 @@ install-cli = "cargo install --path ."
 
 [dependencies]
 python = ">=3.10,<3.14"
-maturin = ">=1.0"
 pip = "*"
 libxkbcommon = "*"
 pkg-config = "*"
 
 [feature.dev.dependencies]
 pre-commit = "*"
+maturin = ">=1.0"
+patchelf = ">=0.17.2"  # needed by maturin
 
 [feature.dev.pypi-dependencies]
 eitype = { path = ".", editable = true }

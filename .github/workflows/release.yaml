@@ -22,10 +22,15 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Set up Python
+      - name: Set up Python versions
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: |
+            3.10
+            3.11
+            3.12
+            3.13
+            3.14
 
       - name: Install maturin
         run: pip install maturin
@@ -34,8 +39,8 @@ jobs:
         run: |
           echo "EITYPE_TAG=$(git describe --tags | sed 's/^v//')" >> $GITHUB_ENV
 
-      - name: Build wheel
-        run: maturin build --release --features python
+      - name: Build wheels
+        run: maturin build --release --features python -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
 
       - name: Publish to Test PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
@@ -74,16 +79,21 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Set up Python
+      - name: Set up Python versions
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: |
+            3.10
+            3.11
+            3.12
+            3.13
+            3.14
 
       - name: Install maturin
         run: pip install maturin
 
-      - name: Build wheel
-        run: maturin build --release --features python
+      - name: Build wheels
+        run: maturin build --release --features python -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
 
       - name: Publish package
         uses: pypa/gh-action-pypi-publish@release/v1
