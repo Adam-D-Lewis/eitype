@@ -6,6 +6,7 @@ description = "A wtype-like CLI tool and library for typing text using Emulated 
 license = "Apache-2.0"
 authors = ["eitype contributors"]
 repository = "https://github.com/Adam-D-Lewis/eitype"
+readme = "README.md"
 keywords = ["wayland", "input", "keyboard", "ei", "libei"]
 categories = ["command-line-utilities", "api-bindings"]
 

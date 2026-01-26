@@ -1,12 +1,13 @@
-name: Test & Publish PyPI release
+name: Release
 
 on:
   release:
     types: [created]
 
 jobs:
-  build-wheels:
-    name: Build wheels
+  # Build x86_64 wheels
+  build-wheels-x86_64:
+    name: Build wheels (x86_64)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -17,6 +18,7 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
+          target: x86_64-unknown-linux-gnu
           manylinux: 2_28
           args: --release --features python -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
           before-script-linux: |
@@ -25,21 +27,47 @@ jobs:
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: wheels
+          name: wheels-x86_64
+          path: target/wheels/*.whl
+
+  # Build aarch64 wheels
+  build-wheels-aarch64:
+    name: Build wheels (aarch64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: aarch64-unknown-linux-gnu
+          manylinux: 2_28
+          args: --release --features python -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
+          before-script-linux: |
+            yum install -y libxkbcommon-devel || dnf install -y libxkbcommon-devel
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-aarch64
           path: target/wheels/*.whl
 
   test-pypi:
     name: Test PyPI release
     runs-on: ubuntu-latest
-    needs: build-wheels
+    needs: [build-wheels-x86_64, build-wheels-aarch64]
     permissions:
       id-token: write
     steps:
-      - name: Download wheels
+      - name: Download all wheels
         uses: actions/download-artifact@v4
         with:
-          name: wheels
+          pattern: wheels-*
           path: dist/
+          merge-multiple: true
 
       - name: Publish to Test PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
@@ -76,14 +104,33 @@ jobs:
       contents: read
 
     steps:
-      - name: Download wheels
+      - name: Download all wheels
         uses: actions/download-artifact@v4
         with:
-          name: wheels
+          pattern: wheels-*
           path: dist/
+          merge-multiple: true
 
       - name: Publish package
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
           verbose: true
+
+  # Publish Rust crate to crates.io
+  release-crates:
+    name: Publish eitype on crates.io
+    runs-on: ubuntu-latest
+    needs: release-pypi
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io
+        run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
