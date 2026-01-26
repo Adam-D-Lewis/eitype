@@ -37,3 +37,6 @@ build/
 
 # Maturin
 .maturin/
+
+# Claude Code local settings
+.claude/settings.local.json
