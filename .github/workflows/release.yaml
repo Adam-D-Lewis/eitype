@@ -46,8 +46,15 @@ jobs:
           target: aarch64-unknown-linux-gnu
           manylinux: 2_28
           args: --release --features python -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
+          docker-options: -e PKG_CONFIG_ALLOW_CROSS=1
           before-script-linux: |
-            (apt-get update && apt-get install -y libxkbcommon-dev) || yum install -y libxkbcommon-devel || dnf install -y libxkbcommon-devel
+            # Install aarch64 libxkbcommon for cross-compilation
+            dpkg --add-architecture arm64
+            . /etc/os-release
+            echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ $VERSION_CODENAME main universe" > /etc/apt/sources.list.d/arm64.list
+            echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ $VERSION_CODENAME-updates main universe" >> /etc/apt/sources.list.d/arm64.list
+            apt-get update
+            apt-get install -y libxkbcommon-dev:arm64
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
