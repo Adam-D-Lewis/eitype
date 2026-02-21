@@ -526,10 +526,7 @@ fn parse_gnome_input_sources(input: &str) -> Vec<(String, String)> {
     let mut results = Vec::new();
     // Split on "), (" to separate entries, handling the surrounding parens/quotes
     for entry in trimmed.split("), (") {
-        let entry = entry
-            .trim()
-            .trim_start_matches('(')
-            .trim_end_matches(')');
+        let entry = entry.trim().trim_start_matches('(').trim_end_matches(')');
         // entry is now: 'type', 'id'
         let parts: Vec<&str> = entry.splitn(2, ", ").collect();
         if parts.len() == 2 {
@@ -548,7 +545,11 @@ fn detect_kde_layout_index() -> Option<u32> {
     // Try qdbus6 first (Plasma 6 / Qt6), then qdbus (Plasma 5 / Qt5)
     for cmd in &["qdbus6", "qdbus"] {
         let output = Command::new(cmd)
-            .args(["org.kde.keyboard", "/Layouts", "org.kde.KeyboardLayouts.getLayout"])
+            .args([
+                "org.kde.keyboard",
+                "/Layouts",
+                "org.kde.KeyboardLayouts.getLayout",
+            ])
             .output();
 
         if let Ok(o) = output {
@@ -579,7 +580,8 @@ fn detect_kde_layout_index() -> Option<u32> {
             // dbus-send output format: "   int32 1\n"
             for line in text.lines() {
                 let line = line.trim();
-                if let Some(val) = line.strip_prefix("int32 ")
+                if let Some(val) = line
+                    .strip_prefix("int32 ")
                     .or_else(|| line.strip_prefix("uint32 "))
                 {
                     if let Ok(idx) = val.trim().parse::<u32>() {
