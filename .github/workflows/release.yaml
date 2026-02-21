@@ -51,6 +51,8 @@ jobs:
             # Install aarch64 libxkbcommon for cross-compilation
             dpkg --add-architecture arm64
             . /etc/os-release
+            # Pin existing sources to amd64 only (arm64 is on ports.ubuntu.com)
+            sed -i 's/^deb http/deb [arch=amd64] http/' /etc/apt/sources.list
             echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ $VERSION_CODENAME main universe" > /etc/apt/sources.list.d/arm64.list
             echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ $VERSION_CODENAME-updates main universe" >> /etc/apt/sources.list.d/arm64.list
             apt-get update
