@@ -96,8 +96,9 @@ pub struct EiTypeConfig {
     pub model: Option<String>,
     /// XKB keyboard options (e.g., "ctrl:nocaps")
     pub options: Option<String>,
-    /// Layout index to use when multiple layouts are available (default: 0)
-    pub layout_index: u32,
+    /// Layout index to use when multiple layouts are available.
+    /// `None` = auto-detect from EI protocol, `Some(n)` = explicit override.
+    pub layout_index: Option<u32>,
     /// Delay between key events in milliseconds (default: 0)
     pub delay_ms: u64,
 }
@@ -106,13 +107,13 @@ pub struct EiTypeConfig {
 #[pymethods]
 impl EiTypeConfig {
     #[new]
-    #[pyo3(signature = (layout=None, variant=None, model=None, options=None, layout_index=0, delay_ms=0))]
+    #[pyo3(signature = (layout=None, variant=None, model=None, options=None, layout_index=None, delay_ms=0))]
     fn py_new(
         layout: Option<String>,
         variant: Option<String>,
         model: Option<String>,
         options: Option<String>,
-        layout_index: u32,
+        layout_index: Option<u32>,
         delay_ms: u64,
     ) -> Self {
         Self {
@@ -134,7 +135,7 @@ impl EiTypeConfig {
             variant: std::env::var("XKB_DEFAULT_VARIANT").ok(),
             model: std::env::var("XKB_DEFAULT_MODEL").ok(),
             options: std::env::var("XKB_DEFAULT_OPTIONS").ok(),
-            layout_index: 0,
+            layout_index: None,
             delay_ms: 0,
         }
     }
@@ -340,6 +341,47 @@ fn keysym_to_char(keysym: u32) -> Option<char> {
     }
 }
 
+/// Poll the EI connection for a KeyboardModifiers event to detect the active layout group.
+/// Uses a short timeout to avoid blocking if no modifiers event is pending.
+fn poll_for_layout_group(
+    poll_stream: &UnixStream,
+    event_iter: &mut impl Iterator<Item = Result<EiEvent, reis::Error>>,
+) -> Option<u32> {
+    use rustix::event::{poll, PollFd, PollFlags};
+    use rustix::time::Timespec;
+
+    let mut pollfd = [PollFd::new(poll_stream, PollFlags::IN)];
+
+    // Wait up to 100ms for modifiers event from compositor.
+    // The event arrives asynchronously from Mutter's main loop after the device is resumed.
+    // 100ms is generous — in practice it arrives within a few milliseconds.
+    // If it doesn't arrive, the active group is likely 0 (default layout).
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: 100_000_000, // 100ms
+    };
+    match poll(&mut pollfd, Some(&timeout)) {
+        Ok(n) if n > 0 => match event_iter.next() {
+            Some(Ok(EiEvent::KeyboardModifiers(mods))) => {
+                info!("Auto-detected active layout group: {}", mods.group);
+                Some(mods.group)
+            }
+            Some(Ok(other)) => {
+                debug!(
+                    "Got {:?} instead of KeyboardModifiers, using default",
+                    other
+                );
+                None
+            }
+            _ => None,
+        },
+        _ => {
+            debug!("No modifiers event received within timeout, using default layout 0");
+            None
+        }
+    }
+}
+
 /// Get current timestamp in microseconds
 fn get_timestamp() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -481,6 +523,11 @@ impl EiType {
 
     /// Internal: create EiType from an already-connected stream
     fn from_stream(stream: UnixStream, config: EiTypeConfig) -> Result<Self, EiTypeError> {
+        // Clone fd for non-blocking polling later (to detect layout group)
+        let poll_stream = stream
+            .try_clone()
+            .map_err(|e| EiTypeError::Connection(format!("Failed to clone stream: {}", e)))?;
+
         let context = ei::Context::new(stream)
             .map_err(|e| EiTypeError::Connection(format!("Failed to create EI context: {}", e)))?;
 
@@ -550,6 +597,16 @@ impl EiType {
 
         let (device, keyboard) = result.ok_or(EiTypeError::NoKeyboard)?;
 
+        // Try to auto-detect active layout group from modifiers event
+        let detected_group = if config.layout_index.is_none() {
+            poll_for_layout_group(&poll_stream, &mut event_iter)
+        } else {
+            None
+        };
+
+        let layout_index = config.layout_index.or(detected_group).unwrap_or(0);
+        info!("Using layout index: {}", layout_index);
+
         let mut eitype = Self {
             connection,
             device,
@@ -560,7 +617,7 @@ impl EiType {
             delay: Duration::from_millis(config.delay_ms),
             held_modifiers: Vec::new(),
             sequence: 1,
-            layout_index: config.layout_index,
+            layout_index,
             closed: false,
         };
 
