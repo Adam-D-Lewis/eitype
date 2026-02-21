@@ -111,7 +111,7 @@ struct Args {
     options: Option<String>,
 
     /// XKB layout index to use when multiple layouts are available.
-    /// If not specified, auto-detects from the EI protocol.
+    /// If not specified, auto-detects from the compositor (GNOME, KDE, Sway).
     #[arg(long, value_name = "INDEX")]
     layout_index: Option<u32>,
 
@@ -255,7 +255,8 @@ fn main() {
     };
 
     env_logger::Builder::new()
-        .filter_level(log_level)
+        .filter_level(log::LevelFilter::Warn)
+        .filter_module("eitype", log_level)
         .format_timestamp(None)
         .init();
 
