@@ -40,7 +40,7 @@ ashpd = "0.12"
 tokio = { version = "1", features = ["rt"] }
 
 # Unix utilities
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "event"] }
 
 # Logging
 log = "0.4"

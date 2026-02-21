@@ -96,8 +96,9 @@ pub struct EiTypeConfig {
     pub model: Option<String>,
     /// XKB keyboard options (e.g., "ctrl:nocaps")
     pub options: Option<String>,
-    /// Layout index to use when multiple layouts are available (default: 0)
-    pub layout_index: u32,
+    /// Layout index to use when multiple layouts are available.
+    /// `None` = auto-detect from EI protocol, `Some(n)` = explicit override.
+    pub layout_index: Option<u32>,
     /// Delay between key events in milliseconds (default: 0)
     pub delay_ms: u64,
 }
@@ -106,13 +107,13 @@ pub struct EiTypeConfig {
 #[pymethods]
 impl EiTypeConfig {
     #[new]
-    #[pyo3(signature = (layout=None, variant=None, model=None, options=None, layout_index=0, delay_ms=0))]
+    #[pyo3(signature = (layout=None, variant=None, model=None, options=None, layout_index=None, delay_ms=0))]
     fn py_new(
         layout: Option<String>,
         variant: Option<String>,
         model: Option<String>,
         options: Option<String>,
-        layout_index: u32,
+        layout_index: Option<u32>,
         delay_ms: u64,
     ) -> Self {
         Self {
@@ -134,7 +135,7 @@ impl EiTypeConfig {
             variant: std::env::var("XKB_DEFAULT_VARIANT").ok(),
             model: std::env::var("XKB_DEFAULT_MODEL").ok(),
             options: std::env::var("XKB_DEFAULT_OPTIONS").ok(),
-            layout_index: 0,
+            layout_index: None,
             delay_ms: 0,
         }
     }
@@ -340,6 +341,334 @@ fn keysym_to_char(keysym: u32) -> Option<char> {
     }
 }
 
+/// Poll the EI connection for a KeyboardModifiers event to detect the active layout group.
+/// Uses a short timeout to avoid blocking if no modifiers event is pending.
+fn poll_for_layout_group(
+    poll_stream: &UnixStream,
+    event_iter: &mut impl Iterator<Item = Result<EiEvent, reis::Error>>,
+) -> Option<u32> {
+    use rustix::event::{poll, PollFd, PollFlags};
+    use rustix::time::Timespec;
+
+    let mut pollfd = [PollFd::new(poll_stream, PollFlags::IN)];
+
+    // Wait up to 100ms for modifiers event from compositor.
+    // The event arrives asynchronously from Mutter's main loop after the device is resumed.
+    // 100ms is generous — in practice it arrives within a few milliseconds.
+    // If it doesn't arrive, the active group is likely 0 (default layout).
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: 100_000_000, // 100ms
+    };
+    match poll(&mut pollfd, Some(&timeout)) {
+        Ok(n) if n > 0 => match event_iter.next() {
+            Some(Ok(EiEvent::KeyboardModifiers(mods))) => {
+                info!("Auto-detected active layout group: {}", mods.group);
+                Some(mods.group)
+            }
+            Some(Ok(other)) => {
+                debug!(
+                    "Got {:?} instead of KeyboardModifiers, using default",
+                    other
+                );
+                None
+            }
+            _ => None,
+        },
+        _ => {
+            debug!("No modifiers event received within timeout, using default layout 0");
+            None
+        }
+    }
+}
+
+/// Detect the active keyboard layout index using compositor-specific methods.
+/// Dispatches based on `$XDG_CURRENT_DESKTOP` and `$SWAYSOCK` environment variables.
+fn detect_active_layout_index() -> Option<u32> {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+
+    if desktop.contains("GNOME") || desktop.contains("Unity") {
+        let result = detect_gnome_layout_index();
+        if result.is_some() {
+            return result;
+        }
+    } else if desktop.contains("KDE") {
+        let result = detect_kde_layout_index();
+        if result.is_some() {
+            return result;
+        }
+    }
+
+    if std::env::var("SWAYSOCK").is_ok() {
+        let result = detect_sway_layout_index();
+        if result.is_some() {
+            return result;
+        }
+    }
+
+    // If desktop wasn't recognized, try GNOME then KDE as generic fallbacks
+    if !desktop.contains("GNOME") && !desktop.contains("Unity") && !desktop.contains("KDE") {
+        if let Some(idx) = detect_gnome_layout_index() {
+            return Some(idx);
+        }
+        if let Some(idx) = detect_kde_layout_index() {
+            return Some(idx);
+        }
+    }
+
+    None
+}
+
+/// Detect active layout index on GNOME by comparing `mru-sources` against `sources`.
+///
+/// The first entry in `mru-sources` is the currently active input source. We find its
+/// position in the `sources` list, counting only `xkb` type sources (IBus sources don't
+/// get their own XKB group).
+fn detect_gnome_layout_index() -> Option<u32> {
+    use std::process::Command;
+
+    let mru_output = Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.input-sources", "mru-sources"])
+        .output();
+
+    let mru_output = match mru_output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Ok(o) => {
+            warn!(
+                "gsettings mru-sources failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return None;
+        }
+        Err(e) => {
+            warn!("Failed to run gsettings: {}", e);
+            return None;
+        }
+    };
+
+    // mru-sources can be empty (@a(ss) []) if never switched
+    if mru_output.starts_with("@") || mru_output == "[]" {
+        debug!("mru-sources is empty, assuming layout index 0");
+        return Some(0);
+    }
+
+    let sources_output = Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.input-sources", "sources"])
+        .output();
+
+    let sources_output = match sources_output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Ok(o) => {
+            warn!(
+                "gsettings sources failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return None;
+        }
+        Err(e) => {
+            warn!("Failed to run gsettings for sources: {}", e);
+            return None;
+        }
+    };
+
+    let mru_entries = parse_gnome_input_sources(&mru_output);
+    let source_entries = parse_gnome_input_sources(&sources_output);
+
+    if mru_entries.is_empty() || source_entries.is_empty() {
+        warn!(
+            "Failed to parse GNOME input sources: mru={:?}, sources={:?}",
+            mru_output, sources_output
+        );
+        return None;
+    }
+
+    let active = &mru_entries[0];
+
+    // Find the position of the active source in the sources list,
+    // counting only xkb sources (IBus engines don't get their own XKB group).
+    let mut xkb_index = 0u32;
+    for entry in &source_entries {
+        if entry.0 == "xkb" {
+            if entry == active {
+                info!(
+                    "GNOME: detected active layout '{}' at XKB group index {}",
+                    active.1, xkb_index
+                );
+                return Some(xkb_index);
+            }
+            xkb_index += 1;
+        } else if entry == active {
+            // Active source is an IBus engine, not an XKB layout — use group 0
+            info!(
+                "GNOME: active source '{}' is IBus, using XKB group index 0",
+                active.1
+            );
+            return Some(0);
+        }
+    }
+
+    warn!(
+        "GNOME: active source {:?} not found in sources list {:?}",
+        active, source_entries
+    );
+    None
+}
+
+/// Parse GNOME GVariant input source list format.
+/// Input: `[('xkb', 'us+dvp'), ('xkb', 'us')]`
+/// Output: `vec![("xkb", "us+dvp"), ("xkb", "us")]`
+fn parse_gnome_input_sources(input: &str) -> Vec<(String, String)> {
+    let trimmed = input.trim().trim_start_matches('[').trim_end_matches(']');
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut results = Vec::new();
+    // Split on "), (" to separate entries, handling the surrounding parens/quotes
+    for entry in trimmed.split("), (") {
+        let entry = entry.trim().trim_start_matches('(').trim_end_matches(')');
+        // entry is now: 'type', 'id'
+        let parts: Vec<&str> = entry.splitn(2, ", ").collect();
+        if parts.len() == 2 {
+            let source_type = parts[0].trim().trim_matches('\'');
+            let source_id = parts[1].trim().trim_matches('\'');
+            results.push((source_type.to_string(), source_id.to_string()));
+        }
+    }
+    results
+}
+
+/// Detect active layout index on KDE Plasma via D-Bus.
+fn detect_kde_layout_index() -> Option<u32> {
+    use std::process::Command;
+
+    // Try qdbus6 first (Plasma 6 / Qt6), then qdbus (Plasma 5 / Qt5)
+    for cmd in &["qdbus6", "qdbus"] {
+        let output = Command::new(cmd)
+            .args([
+                "org.kde.keyboard",
+                "/Layouts",
+                "org.kde.KeyboardLayouts.getLayout",
+            ])
+            .output();
+
+        if let Ok(o) = output {
+            if o.status.success() {
+                let text = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if let Ok(idx) = text.parse::<u32>() {
+                    info!("KDE: detected active layout index {} via {}", idx, cmd);
+                    return Some(idx);
+                }
+            }
+        }
+    }
+
+    // Fall back to dbus-send (no Qt dependency)
+    let output = Command::new("dbus-send")
+        .args([
+            "--session",
+            "--print-reply",
+            "--dest=org.kde.keyboard",
+            "/Layouts",
+            "org.kde.KeyboardLayouts.getLayout",
+        ])
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            // dbus-send output format: "   int32 1\n"
+            for line in text.lines() {
+                let line = line.trim();
+                if let Some(val) = line
+                    .strip_prefix("int32 ")
+                    .or_else(|| line.strip_prefix("uint32 "))
+                {
+                    if let Ok(idx) = val.trim().parse::<u32>() {
+                        info!("KDE: detected active layout index {} via dbus-send", idx);
+                        return Some(idx);
+                    }
+                }
+            }
+            warn!("KDE: could not parse dbus-send output: {}", text.trim());
+            None
+        }
+        Ok(_) => {
+            debug!("KDE keyboard D-Bus service not available");
+            None
+        }
+        Err(e) => {
+            warn!("Failed to run dbus-send: {}", e);
+            None
+        }
+    }
+}
+
+/// Detect active layout index on Sway via `swaymsg -t get_inputs`.
+fn detect_sway_layout_index() -> Option<u32> {
+    use std::process::Command;
+
+    let output = Command::new("swaymsg")
+        .args(["-t", "get_inputs", "--raw"])
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        Ok(o) => {
+            warn!(
+                "swaymsg failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return None;
+        }
+        Err(e) => {
+            warn!("Failed to run swaymsg: {}", e);
+            return None;
+        }
+    };
+
+    // Parse JSON without adding serde_json dependency.
+    // Look for keyboard devices and extract xkb_active_layout_index.
+    // We find the first keyboard device's layout index.
+    parse_sway_layout_index(&output)
+}
+
+/// Extract `xkb_active_layout_index` from swaymsg JSON output.
+/// Uses simple string matching to avoid adding serde_json as a dependency.
+fn parse_sway_layout_index(json: &str) -> Option<u32> {
+    // Strategy: find blocks containing `"type": "keyboard"` and extract
+    // `xkb_active_layout_index` from the same object.
+    //
+    // We look for xkb_active_layout_index near a keyboard type indicator.
+    // Since swaymsg returns a flat array of input devices, we scan for
+    // the pattern in order.
+    let mut in_keyboard = false;
+
+    for line in json.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.contains("\"type\"") && trimmed.contains("\"keyboard\"") {
+            in_keyboard = true;
+        } else if in_keyboard && trimmed.contains("\"type\"") {
+            // Moved past the keyboard device into another device type
+            in_keyboard = false;
+        }
+
+        if in_keyboard {
+            if let Some(idx_str) = trimmed.strip_prefix("\"xkb_active_layout_index\":") {
+                let idx_str = idx_str.trim().trim_end_matches(',');
+                if let Ok(idx) = idx_str.trim().parse::<u32>() {
+                    info!("Sway: detected active layout index {}", idx);
+                    return Some(idx);
+                }
+            }
+        }
+    }
+
+    warn!("Sway: no keyboard device with xkb_active_layout_index found");
+    None
+}
+
 /// Get current timestamp in microseconds
 fn get_timestamp() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -481,6 +810,11 @@ impl EiType {
 
     /// Internal: create EiType from an already-connected stream
     fn from_stream(stream: UnixStream, config: EiTypeConfig) -> Result<Self, EiTypeError> {
+        // Clone fd for non-blocking polling later (to detect layout group)
+        let poll_stream = stream
+            .try_clone()
+            .map_err(|e| EiTypeError::Connection(format!("Failed to clone stream: {}", e)))?;
+
         let context = ei::Context::new(stream)
             .map_err(|e| EiTypeError::Connection(format!("Failed to create EI context: {}", e)))?;
 
@@ -550,6 +884,27 @@ impl EiType {
 
         let (device, keyboard) = result.ok_or(EiTypeError::NoKeyboard)?;
 
+        // Try to auto-detect active layout group from modifiers event
+        let detected_group = if config.layout_index.is_none() {
+            poll_for_layout_group(&poll_stream, &mut event_iter)
+        } else {
+            None
+        };
+
+        let layout_index = config
+            .layout_index
+            .or(detected_group)
+            .or_else(|| {
+                if config.layout_index.is_none() {
+                    info!("No layout group from EI protocol, trying compositor-specific detection");
+                    detect_active_layout_index()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        info!("Using layout index: {}", layout_index);
+
         let mut eitype = Self {
             connection,
             device,
@@ -560,7 +915,7 @@ impl EiType {
             delay: Duration::from_millis(config.delay_ms),
             held_modifiers: Vec::new(),
             sequence: 1,
-            layout_index: config.layout_index,
+            layout_index,
             closed: false,
         };
 
@@ -1251,5 +1606,86 @@ xkb_keymap {
             "'a' should be found at layout_index=1, got: {:?}",
             result
         );
+    }
+
+    #[test]
+    fn test_parse_gnome_input_sources_typical() {
+        let input = "[('xkb', 'us+dvp'), ('xkb', 'us')]";
+        let result = parse_gnome_input_sources(input);
+        assert_eq!(
+            result,
+            vec![
+                ("xkb".to_string(), "us+dvp".to_string()),
+                ("xkb".to_string(), "us".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_gnome_input_sources_single() {
+        let input = "[('xkb', 'us')]";
+        let result = parse_gnome_input_sources(input);
+        assert_eq!(result, vec![("xkb".to_string(), "us".to_string())]);
+    }
+
+    #[test]
+    fn test_parse_gnome_input_sources_with_ibus() {
+        let input = "[('xkb', 'us'), ('ibus', 'anthy')]";
+        let result = parse_gnome_input_sources(input);
+        assert_eq!(
+            result,
+            vec![
+                ("xkb".to_string(), "us".to_string()),
+                ("ibus".to_string(), "anthy".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_gnome_input_sources_empty() {
+        assert!(parse_gnome_input_sources("[]").is_empty());
+        assert!(parse_gnome_input_sources("").is_empty());
+    }
+
+    #[test]
+    fn test_parse_sway_layout_index_typical() {
+        let json = r#"[
+  {
+    "identifier": "1:1:AT_Translated_Set_2_keyboard",
+    "name": "AT Translated Set 2 keyboard",
+    "type": "keyboard",
+    "xkb_active_layout_index": 1,
+    "xkb_active_layout_name": "English (US)"
+  },
+  {
+    "identifier": "2:2:Mouse",
+    "name": "Mouse",
+    "type": "pointer"
+  }
+]"#;
+        assert_eq!(parse_sway_layout_index(json), Some(1));
+    }
+
+    #[test]
+    fn test_parse_sway_layout_index_zero() {
+        let json = r#"[
+  {
+    "type": "keyboard",
+    "xkb_active_layout_index": 0,
+    "xkb_active_layout_name": "English (US)"
+  }
+]"#;
+        assert_eq!(parse_sway_layout_index(json), Some(0));
+    }
+
+    #[test]
+    fn test_parse_sway_layout_index_no_keyboard() {
+        let json = r#"[
+  {
+    "type": "pointer",
+    "name": "Mouse"
+  }
+]"#;
+        assert_eq!(parse_sway_layout_index(json), None);
     }
 }
