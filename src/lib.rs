@@ -268,7 +268,9 @@ fn find_keycode_for_char(
         let num_layouts = keymap.num_layouts_for_key(keycode);
 
         if layout_index < num_layouts {
-            if let Some(result) = search_key_for_char(ch, keymap, keycode, keycode_raw, layout_index) {
+            if let Some(result) =
+                search_key_for_char(ch, keymap, keycode, keycode_raw, layout_index)
+            {
                 return Ok(result);
             }
         }
