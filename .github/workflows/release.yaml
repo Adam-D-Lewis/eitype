@@ -22,7 +22,7 @@ jobs:
           manylinux: 2_28
           args: --release --features python -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
           before-script-linux: |
-            yum install -y libxkbcommon-devel || dnf install -y libxkbcommon-devel
+            (apt-get update && apt-get install -y libxkbcommon-dev) || yum install -y libxkbcommon-devel || dnf install -y libxkbcommon-devel
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -47,7 +47,7 @@ jobs:
           manylinux: 2_28
           args: --release --features python -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
           before-script-linux: |
-            yum install -y libxkbcommon-devel || dnf install -y libxkbcommon-devel
+            (apt-get update && apt-get install -y libxkbcommon-dev) || yum install -y libxkbcommon-devel || dnf install -y libxkbcommon-devel
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
