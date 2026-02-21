@@ -245,7 +245,15 @@ fn build_key_to_keycode_map() -> HashMap<String, u32> {
     map
 }
 
-/// Find the keycode for a character, and whether shift is needed
+/// Find the keycode for a character, and whether shift is needed.
+///
+/// Uses a two-pass approach:
+/// 1. First pass: search only keys that explicitly define the requested layout (exact match)
+/// 2. Second pass: fall back to layout 0 for keys that don't define the requested layout
+///    (layout-independent keys like space, enter, tab)
+///
+/// This ensures keys at the requested layout take priority, while layout-independent
+/// keys are still found via fallback.
 fn find_keycode_for_char(
     ch: char,
     keymap: &xkb::Keymap,
@@ -254,31 +262,61 @@ fn find_keycode_for_char(
     let min_keycode: u32 = keymap.min_keycode().into();
     let max_keycode: u32 = keymap.max_keycode().into();
 
+    // Pass 1: search keys that have the requested layout
     for keycode_raw in min_keycode..=max_keycode {
         let keycode = xkb::Keycode::new(keycode_raw);
         let num_layouts = keymap.num_layouts_for_key(keycode);
 
         if layout_index < num_layouts {
-            let num_levels = keymap.num_levels_for_key(keycode, layout_index);
+            if let Some(result) = search_key_for_char(ch, keymap, keycode, keycode_raw, layout_index) {
+                return Ok(result);
+            }
+        }
+    }
 
-            for level in 0..num_levels {
-                let syms = keymap.key_get_syms_by_level(keycode, layout_index, level);
+    // Pass 2: fall back to layout 0 for keys that don't define the requested layout
+    if layout_index != 0 {
+        for keycode_raw in min_keycode..=max_keycode {
+            let keycode = xkb::Keycode::new(keycode_raw);
+            let num_layouts = keymap.num_layouts_for_key(keycode);
 
-                for sym in syms {
-                    let sym_raw: u32 = (*sym).into();
-                    if let Some(sym_char) = keysym_to_char(sym_raw) {
-                        if sym_char == ch {
-                            let need_shift = level == 1;
-                            let evdev_keycode = keycode_raw - 8;
-                            return Ok((evdev_keycode, need_shift));
-                        }
-                    }
+            if layout_index >= num_layouts && num_layouts > 0 {
+                if let Some(result) = search_key_for_char(ch, keymap, keycode, keycode_raw, 0) {
+                    return Ok(result);
                 }
             }
         }
     }
 
     Err(EiTypeError::CharNotFound(ch))
+}
+
+/// Search a single key at a given layout for a character match.
+fn search_key_for_char(
+    ch: char,
+    keymap: &xkb::Keymap,
+    keycode: xkb::Keycode,
+    keycode_raw: u32,
+    layout: u32,
+) -> Option<(u32, bool)> {
+    let num_levels = keymap.num_levels_for_key(keycode, layout);
+
+    for level in 0..num_levels {
+        let syms = keymap.key_get_syms_by_level(keycode, layout, level);
+
+        for sym in syms {
+            let sym_raw: u32 = (*sym).into();
+            if let Some(sym_char) = keysym_to_char(sym_raw) {
+                if sym_char == ch {
+                    let need_shift = level == 1;
+                    let evdev_keycode = keycode_raw - 8;
+                    return Some((evdev_keycode, need_shift));
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Convert an XKB keysym to a character
@@ -1114,5 +1152,102 @@ mod tests {
         assert_eq!(libc::EAGAIN, 11);
         // On Linux, EWOULDBLOCK is the same as EAGAIN
         assert_eq!(libc::EWOULDBLOCK, libc::EAGAIN);
+    }
+
+    /// Create a minimal two-layout XKB keymap where SPCE only defines one group.
+    /// This reproduces the real-world scenario where layout-independent keys
+    /// like space have fewer groups than the global keymap layout count.
+    fn make_two_layout_keymap_with_single_group_space() -> xkb::Keymap {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_DEFAULT_INCLUDES);
+        let keymap_str = r#"
+xkb_keymap {
+    xkb_keycodes "test" {
+        minimum = 8;
+        maximum = 255;
+        <SPCE> = 65;
+        <AC01> = 38;
+        <AD01> = 24;
+    };
+    xkb_types "test" {
+        virtual_modifiers NumLock;
+        type "ONE_LEVEL" {
+            modifiers = none;
+            level_name[Level1] = "Any";
+        };
+        type "TWO_LEVEL" {
+            modifiers = Shift;
+            map[Shift] = Level2;
+            level_name[Level1] = "Base";
+            level_name[Level2] = "Shift";
+        };
+    };
+    xkb_compatibility "test" {
+        interpret Any+AnyOf(all) { action = SetMods(modifiers=modMapMods,clearLocks); };
+    };
+    xkb_symbols "test" {
+        name[group1] = "English (US)";
+        name[group2] = "English (Programmer Dvorak)";
+
+        // Space: only ONE group (layout-independent) — triggers the bug
+        key <SPCE> { [ space ] };
+
+        // Letter keys: two groups (different in each layout)
+        key <AC01> {
+            symbols[Group1] = [ a, A ],
+            symbols[Group2] = [ a, A ]
+        };
+        key <AD01> {
+            symbols[Group1] = [ q, Q ],
+            symbols[Group2] = [ semicolon, colon ]
+        };
+    };
+};
+"#;
+        xkb::Keymap::new_from_string(
+            &context,
+            keymap_str.to_string(),
+            xkb::KEYMAP_FORMAT_TEXT_V1,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("Failed to create test keymap")
+    }
+
+    #[test]
+    fn test_find_keycode_for_char_space_at_layout_1() {
+        let keymap = make_two_layout_keymap_with_single_group_space();
+        // Space should be findable regardless of layout index.
+        // This reproduces the bug: with layout_index=1, keys that only
+        // define 1 layout (like space) are skipped, causing CharNotFound.
+        let result = find_keycode_for_char(' ', &keymap, 1);
+        assert!(
+            result.is_ok(),
+            "Space should be found at layout_index=1, got: {:?}",
+            result
+        );
+        let (keycode, _need_shift) = result.unwrap();
+        // evdev keycode for space is 57 (XKB 65 - 8)
+        assert_eq!(keycode, 57, "Space should map to evdev keycode 57");
+    }
+
+    #[test]
+    fn test_find_keycode_for_char_space_at_layout_0() {
+        let keymap = make_two_layout_keymap_with_single_group_space();
+        // Baseline: space at layout 0 should always work
+        let result = find_keycode_for_char(' ', &keymap, 0);
+        assert!(result.is_ok(), "Space should be found at layout_index=0");
+        let (keycode, _need_shift) = result.unwrap();
+        assert_eq!(keycode, 57);
+    }
+
+    #[test]
+    fn test_find_keycode_for_char_letter_at_layout_1() {
+        let keymap = make_two_layout_keymap_with_single_group_space();
+        // Letters should be findable at layout_index=1 (dvp layout)
+        let result = find_keycode_for_char('a', &keymap, 1);
+        assert!(
+            result.is_ok(),
+            "'a' should be found at layout_index=1, got: {:?}",
+            result
+        );
     }
 }
