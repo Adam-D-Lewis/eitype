@@ -96,8 +96,9 @@ pub struct EiTypeConfig {
     pub model: Option<String>,
     /// XKB keyboard options (e.g., "ctrl:nocaps")
     pub options: Option<String>,
-    /// Layout index to use when multiple layouts are available (default: 0)
-    pub layout_index: u32,
+    /// Layout index to use when multiple layouts are available.
+    /// `None` = auto-detect from desktop environment, falling back to 0.
+    pub layout_index: Option<u32>,
     /// Delay between key events in milliseconds (default: 0)
     pub delay_ms: u64,
 }
@@ -106,13 +107,13 @@ pub struct EiTypeConfig {
 #[pymethods]
 impl EiTypeConfig {
     #[new]
-    #[pyo3(signature = (layout=None, variant=None, model=None, options=None, layout_index=0, delay_ms=0))]
+    #[pyo3(signature = (layout=None, variant=None, model=None, options=None, layout_index=None, delay_ms=0))]
     fn py_new(
         layout: Option<String>,
         variant: Option<String>,
         model: Option<String>,
         options: Option<String>,
-        layout_index: u32,
+        layout_index: Option<u32>,
         delay_ms: u64,
     ) -> Self {
         Self {
@@ -134,7 +135,7 @@ impl EiTypeConfig {
             variant: std::env::var("XKB_DEFAULT_VARIANT").ok(),
             model: std::env::var("XKB_DEFAULT_MODEL").ok(),
             options: std::env::var("XKB_DEFAULT_OPTIONS").ok(),
-            layout_index: 0,
+            layout_index: None,
             delay_ms: 0,
         }
     }
@@ -305,6 +306,90 @@ fn get_timestamp() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let start = START.get_or_init(Instant::now);
     start.elapsed().as_micros() as u64
+}
+
+/// Try to detect the active keyboard layout index from the desktop environment.
+///
+/// Tries GNOME first, then KDE Plasma. Returns `None` if detection fails
+/// (expected on unsupported desktops).
+fn detect_active_layout_index() -> Option<u32> {
+    if let Some(index) = detect_gnome_layout_index() {
+        return Some(index);
+    }
+    if let Some(index) = detect_kde_layout_index() {
+        return Some(index);
+    }
+    None
+}
+
+/// Detect active layout index on GNOME via gsettings.
+fn detect_gnome_layout_index() -> Option<u32> {
+    let output = std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.input-sources", "current"])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            // Output is like "uint32 1"
+            let index = stdout
+                .trim()
+                .rsplit_once(' ')
+                .and_then(|(_, n)| n.parse::<u32>().ok());
+            if let Some(i) = index {
+                info!("Auto-detected GNOME active layout index: {}", i);
+                return Some(i);
+            }
+            debug!("Failed to parse GNOME layout index from: {:?}", stdout.trim());
+            None
+        }
+        Ok(out) => {
+            debug!(
+                "gsettings returned non-zero exit code: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            None
+        }
+        Err(e) => {
+            debug!("gsettings not available: {}", e);
+            None
+        }
+    }
+}
+
+/// Detect active layout index on KDE Plasma via qdbus.
+fn detect_kde_layout_index() -> Option<u32> {
+    let output = std::process::Command::new("qdbus")
+        .args([
+            "org.kde.keyboard",
+            "/Layouts",
+            "org.kde.KeyboardLayouts.getLayout",
+        ])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let index = stdout.trim().parse::<u32>().ok();
+            if let Some(i) = index {
+                info!("Auto-detected KDE active layout index: {}", i);
+                return Some(i);
+            }
+            debug!("Failed to parse KDE layout index from: {:?}", stdout.trim());
+            None
+        }
+        Ok(out) => {
+            debug!(
+                "qdbus returned non-zero exit code: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            None
+        }
+        Err(e) => {
+            debug!("qdbus not available: {}", e);
+            None
+        }
+    }
 }
 
 // ============================================================================
@@ -510,6 +595,14 @@ impl EiType {
 
         let (device, keyboard) = result.ok_or(EiTypeError::NoKeyboard)?;
 
+        let layout_index = config.layout_index.unwrap_or_else(|| {
+            detect_active_layout_index().unwrap_or_else(|| {
+                info!("No active layout detected, defaulting to layout index 0");
+                0
+            })
+        });
+        info!("Using layout index: {}", layout_index);
+
         let mut eitype = Self {
             connection,
             device,
@@ -520,7 +613,7 @@ impl EiType {
             delay: Duration::from_millis(config.delay_ms),
             held_modifiers: Vec::new(),
             sequence: 1,
-            layout_index: config.layout_index,
+            layout_index,
             closed: false,
         };
 
@@ -1071,6 +1164,7 @@ mod tests {
     fn test_config_default() {
         let config = EiTypeConfig::default();
         assert!(config.layout.is_none());
+        assert!(config.layout_index.is_none());
         assert!(!config.is_specified());
     }
 

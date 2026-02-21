@@ -172,16 +172,20 @@ eitype --layout-index 1 "Hello"
 
 ### Multi-Layout Keymaps
 
-When the EI server provides a keymap with multiple layouts (e.g., Dvorak + QWERTY), eitype uses layout index 0 by default. This is typically correct since layout 0 is the first/active layout.
+When the EI server provides a keymap with multiple layouts (e.g., US + German), eitype automatically detects the active layout index from your desktop environment:
 
-If you need to use a different layout, specify it with `--layout-index`:
+- **GNOME**: Reads from `gsettings org.gnome.desktop.input-sources current`
+- **KDE Plasma**: Reads from `qdbus org.kde.keyboard /Layouts org.kde.KeyboardLayouts.getLayout`
+- **Other desktops**: Falls back to layout index 0
+
+To override auto-detection, specify the index explicitly with `--layout-index`:
 
 ```bash
-# Use the second layout (index 1)
+# Force the second layout (index 1)
 eitype --layout-index 1 "Hello"
 ```
 
-Use `-vv` to see all available layouts in the keymap.
+Use `-vv` to see all available layouts in the keymap and which index was selected.
 
 ### Environment Variables
 

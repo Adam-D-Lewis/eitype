@@ -110,9 +110,9 @@ struct Args {
     #[arg(long, value_name = "OPTIONS")]
     options: Option<String>,
 
-    /// XKB layout index to use when multiple layouts are available (default: 0)
-    #[arg(long, value_name = "INDEX", default_value = "0")]
-    layout_index: u32,
+    /// XKB layout index to use when multiple layouts are available (auto-detect if not specified)
+    #[arg(long, value_name = "INDEX")]
+    layout_index: Option<u32>,
 
     /// Verbose output
     #[arg(short = 'v', long, action = clap::ArgAction::Count)]
@@ -363,7 +363,26 @@ mod tests {
         let config = args.to_config();
         assert_eq!(config.layout, Some("de".to_string()));
         assert_eq!(config.variant, Some("nodeadkeys".to_string()));
+        assert!(config.layout_index.is_none());
         assert_eq!(config.delay_ms, 50);
+    }
+
+    #[test]
+    fn test_cli_parsing_layout_index() {
+        let args = Args::try_parse_from(["eitype", "--layout-index", "1", "hello"]).unwrap();
+        assert_eq!(args.layout_index, Some(1));
+
+        let config = args.to_config();
+        assert_eq!(config.layout_index, Some(1));
+    }
+
+    #[test]
+    fn test_cli_parsing_layout_index_default_is_none() {
+        let args = Args::try_parse_from(["eitype", "hello"]).unwrap();
+        assert!(args.layout_index.is_none());
+
+        let config = args.to_config();
+        assert!(config.layout_index.is_none());
     }
 
     #[test]
