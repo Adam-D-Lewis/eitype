@@ -28,6 +28,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use hangul::HangulExt;
 use xkbcommon::xkb;
 
 #[cfg(feature = "python")]
@@ -1133,8 +1134,10 @@ impl EiType {
         Ok(())
     }
 
-    fn type_char(&self, ch: char) -> Result<(), EiTypeError> {
-        trace!("Typing character: {:?}", ch);
+    /// Type a character by directly looking up its keycode in the keymap.
+    /// Does not perform any character decomposition (e.g. Hangul syllable splitting).
+    fn type_char_direct(&self, ch: char) -> Result<(), EiTypeError> {
+        trace!("Typing character directly: {:?}", ch);
 
         if let Some(keymap) = &self.keymap {
             let (keycode, need_shift) = find_keycode_for_char(ch, keymap, self.layout_index)?;
@@ -1174,6 +1177,49 @@ impl EiType {
         }
 
         Ok(())
+    }
+
+    /// Type a character, with fallback decomposition for Hangul syllables and Jamo.
+    ///
+    /// For Hangul syllables (U+AC00~U+D7A3), decomposes into individual Compatibility Jamo
+    /// and types each one. The compositor's IME recomposes them into syllables.
+    /// For Hangul Jamo (U+1100~U+11FF), converts to Compatibility Jamo (U+3131~U+3163).
+    fn type_char(&self, ch: char) -> Result<(), EiTypeError> {
+        trace!("Typing character: {:?}", ch);
+
+        match self.type_char_direct(ch) {
+            Ok(()) => Ok(()),
+            Err(EiTypeError::CharNotFound(_)) => {
+                // Hangul syllable decomposition (U+AC00~U+D7A3)
+                if ch.is_syllable() {
+                    // Safe to unwrap: is_syllable() guarantees jamos() succeeds
+                    for jamo in ch.jamos().unwrap() {
+                        match self.type_char_direct(jamo) {
+                            Ok(()) => {}
+                            Err(EiTypeError::CharNotFound(_)) => {
+                                // Complex trailing consonant: split into two simple ones
+                                if let Some((j1, j2)) = decompose_complex_jongseong(jamo) {
+                                    self.type_char_direct(j1)?;
+                                    self.type_char_direct(j2)?;
+                                } else {
+                                    return Err(EiTypeError::CharNotFound(jamo));
+                                }
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    return Ok(());
+                }
+
+                // Hangul Jamo (U+1100~U+11FF) → Compatibility Jamo (U+3131~U+3163)
+                if let Some(compat) = jamo_to_compat_jamo(ch) {
+                    return self.type_char_direct(compat);
+                }
+
+                Err(EiTypeError::CharNotFound(ch))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Type a string of text
@@ -1415,6 +1461,73 @@ fn eitype(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<EiType>()?;
     m.add_class::<EiTypeConfig>()?;
     Ok(())
+}
+
+// ============================================================================
+// Hangul Support
+// ============================================================================
+
+// Mapping tables for converting Hangul Jamo (U+1100~U+11FF) to Compatibility Jamo (U+3131~U+3163).
+// XKB Korean keymaps use Compatibility Jamo keysyms, so this conversion is needed when input text
+// contains characters from the Hangul Jamo block.
+
+/// Choseong (leading consonant) Jamo U+1100..=U+1112 → Compatibility Jamo
+const CHOSEONG_TO_COMPAT: [char; 19] = [
+    'ㄱ', 'ㄲ', 'ㄴ', 'ㄷ', 'ㄸ', 'ㄹ', 'ㅁ', 'ㅂ', 'ㅃ', 'ㅅ',
+    'ㅆ', 'ㅇ', 'ㅈ', 'ㅉ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ',
+];
+
+/// Jungseong (vowel) Jamo U+1161..=U+1175 → Compatibility Jamo
+const JUNGSEONG_TO_COMPAT: [char; 21] = [
+    'ㅏ', 'ㅐ', 'ㅑ', 'ㅒ', 'ㅓ', 'ㅔ', 'ㅕ', 'ㅖ', 'ㅗ', 'ㅘ',
+    'ㅙ', 'ㅚ', 'ㅛ', 'ㅜ', 'ㅝ', 'ㅞ', 'ㅟ', 'ㅠ', 'ㅡ', 'ㅢ', 'ㅣ',
+];
+
+/// Jongseong (trailing consonant) Jamo U+11A8..=U+11C2 → Compatibility Jamo
+const JONGSEONG_TO_COMPAT: [char; 27] = [
+    'ㄱ', 'ㄲ', 'ㄳ', 'ㄴ', 'ㄵ', 'ㄶ', 'ㄷ', 'ㄹ', 'ㄺ', 'ㄻ',
+    'ㄼ', 'ㄽ', 'ㄾ', 'ㄿ', 'ㅀ', 'ㅁ', 'ㅂ', 'ㅄ', 'ㅅ', 'ㅆ',
+    'ㅇ', 'ㅈ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ',
+];
+
+/// Decompose a complex trailing consonant (Jongseong) into two simple consonants.
+/// Complex Jongseong may not have their own key in XKB keymaps and need to be typed
+/// as two separate keystrokes.
+fn decompose_complex_jongseong(ch: char) -> Option<(char, char)> {
+    match ch {
+        'ㄳ' => Some(('ㄱ', 'ㅅ')),
+        'ㄵ' => Some(('ㄴ', 'ㅈ')),
+        'ㄶ' => Some(('ㄴ', 'ㅎ')),
+        'ㄺ' => Some(('ㄹ', 'ㄱ')),
+        'ㄻ' => Some(('ㄹ', 'ㅁ')),
+        'ㄼ' => Some(('ㄹ', 'ㅂ')),
+        'ㄽ' => Some(('ㄹ', 'ㅅ')),
+        'ㄾ' => Some(('ㄹ', 'ㅌ')),
+        'ㄿ' => Some(('ㄹ', 'ㅍ')),
+        'ㅀ' => Some(('ㄹ', 'ㅎ')),
+        'ㅄ' => Some(('ㅂ', 'ㅅ')),
+        _ => None,
+    }
+}
+
+/// Convert a Hangul Jamo block character (U+1100~U+11FF) to a Compatibility Jamo
+/// character (U+3131~U+3163). XKB Korean keymaps use Compatibility Jamo keysyms,
+/// so this conversion is needed when input text contains decomposed Jamo.
+fn jamo_to_compat_jamo(ch: char) -> Option<char> {
+    let code = ch as u32;
+    // Choseong (leading consonant): U+1100..=U+1112
+    if (0x1100..=0x1112).contains(&code) {
+        return Some(CHOSEONG_TO_COMPAT[(code - 0x1100) as usize]);
+    }
+    // Jungseong (vowel): U+1161..=U+1175
+    if (0x1161..=0x1175).contains(&code) {
+        return Some(JUNGSEONG_TO_COMPAT[(code - 0x1161) as usize]);
+    }
+    // Jongseong (trailing consonant): U+11A8..=U+11C2
+    if (0x11A8..=0x11C2).contains(&code) {
+        return Some(JONGSEONG_TO_COMPAT[(code - 0x11A8) as usize]);
+    }
+    None
 }
 
 // ============================================================================
@@ -1687,5 +1800,79 @@ xkb_keymap {
   }
 ]"#;
         assert_eq!(parse_sway_layout_index(json), None);
+    }
+
+    // Hangul support tests
+
+    #[test]
+    fn test_hangul_syllable_decomposition_via_crate() {
+        // '안' = U+C548: choseong ㅇ, jungseong ㅏ, jongseong ㄴ
+        let jamos: Vec<char> = '안'.jamos().unwrap().collect();
+        assert_eq!(jamos, vec!['ㅇ', 'ㅏ', 'ㄴ']);
+
+        // '가' = U+AC00: choseong ㄱ, jungseong ㅏ, no jongseong
+        let jamos: Vec<char> = '가'.jamos().unwrap().collect();
+        assert_eq!(jamos, vec!['ㄱ', 'ㅏ']);
+
+        // '닭' = choseong ㄷ, jungseong ㅏ, jongseong ㄺ (complex)
+        let jamos: Vec<char> = '닭'.jamos().unwrap().collect();
+        assert_eq!(jamos, vec!['ㄷ', 'ㅏ', 'ㄺ']);
+
+        // '힣' = U+D7A3 (last valid syllable): choseong ㅎ, jungseong ㅣ, jongseong ㅎ
+        let jamos: Vec<char> = '힣'.jamos().unwrap().collect();
+        assert_eq!(jamos, vec!['ㅎ', 'ㅣ', 'ㅎ']);
+
+        // Non-Hangul: is_syllable returns false
+        assert!(!('A'.is_syllable()));
+        assert!(!('漢'.is_syllable()));
+        assert!(!('ㄱ'.is_syllable())); // Compatibility Jamo is not a syllable
+    }
+
+    #[test]
+    fn test_decompose_complex_jongseong() {
+        // All 11 complex trailing consonants
+        assert_eq!(decompose_complex_jongseong('ㄳ'), Some(('ㄱ', 'ㅅ')));
+        assert_eq!(decompose_complex_jongseong('ㄵ'), Some(('ㄴ', 'ㅈ')));
+        assert_eq!(decompose_complex_jongseong('ㄶ'), Some(('ㄴ', 'ㅎ')));
+        assert_eq!(decompose_complex_jongseong('ㄺ'), Some(('ㄹ', 'ㄱ')));
+        assert_eq!(decompose_complex_jongseong('ㄻ'), Some(('ㄹ', 'ㅁ')));
+        assert_eq!(decompose_complex_jongseong('ㄼ'), Some(('ㄹ', 'ㅂ')));
+        assert_eq!(decompose_complex_jongseong('ㄽ'), Some(('ㄹ', 'ㅅ')));
+        assert_eq!(decompose_complex_jongseong('ㄾ'), Some(('ㄹ', 'ㅌ')));
+        assert_eq!(decompose_complex_jongseong('ㄿ'), Some(('ㄹ', 'ㅍ')));
+        assert_eq!(decompose_complex_jongseong('ㅀ'), Some(('ㄹ', 'ㅎ')));
+        assert_eq!(decompose_complex_jongseong('ㅄ'), Some(('ㅂ', 'ㅅ')));
+
+        // Simple consonants return None
+        assert_eq!(decompose_complex_jongseong('ㄱ'), None);
+        assert_eq!(decompose_complex_jongseong('ㄴ'), None);
+        assert_eq!(decompose_complex_jongseong('ㅎ'), None);
+
+        // Non-consonant returns None
+        assert_eq!(decompose_complex_jongseong('ㅏ'), None);
+        assert_eq!(decompose_complex_jongseong('A'), None);
+    }
+
+    #[test]
+    fn test_jamo_to_compat_jamo() {
+        // Choseong: U+1100 (ᄀ) → ㄱ (U+3131)
+        assert_eq!(jamo_to_compat_jamo('\u{1100}'), Some('ㄱ'));
+        // Choseong: U+1112 (ᄒ) → ㅎ (U+314E)
+        assert_eq!(jamo_to_compat_jamo('\u{1112}'), Some('ㅎ'));
+
+        // Jungseong: U+1161 (ᅡ) → ㅏ (U+314F)
+        assert_eq!(jamo_to_compat_jamo('\u{1161}'), Some('ㅏ'));
+        // Jungseong: U+1175 (ᅵ) → ㅣ (U+3163)
+        assert_eq!(jamo_to_compat_jamo('\u{1175}'), Some('ㅣ'));
+
+        // Jongseong: U+11A8 (ᆨ) → ㄱ (U+3131)
+        assert_eq!(jamo_to_compat_jamo('\u{11A8}'), Some('ㄱ'));
+        // Jongseong: U+11C2 (ᇂ) → ㅎ (U+314E)
+        assert_eq!(jamo_to_compat_jamo('\u{11C2}'), Some('ㅎ'));
+
+        // Out of range returns None
+        assert_eq!(jamo_to_compat_jamo('A'), None);
+        assert_eq!(jamo_to_compat_jamo('ㄱ'), None); // Already Compat Jamo
+        assert_eq!(jamo_to_compat_jamo('가'), None); // Syllable, not Jamo
     }
 }

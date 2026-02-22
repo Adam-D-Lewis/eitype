@@ -46,6 +46,9 @@ rustix = { version = "1", features = ["fs", "event"] }
 log = "0.4"
 env_logger = "0.11"
 
+# Korean Hangul syllable decomposition
+hangul = "0.1.3"
+
 # Python bindings (optional)
 pyo3 = { version = "0.27", features = ["extension-module"], optional = true }
 
