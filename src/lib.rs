@@ -33,6 +33,24 @@ use xkbcommon::xkb;
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 
+// evdev keycodes for modifier and common keys
+const KEY_SHIFT_L: u32 = 42;
+const KEY_SHIFT_R: u32 = 54;
+const KEY_CTRL_L: u32 = 29;
+const KEY_CTRL_R: u32 = 97;
+const KEY_ALT_L: u32 = 56;
+const KEY_ALT_R: u32 = 100;
+const KEY_SUPER: u32 = 125;
+const KEY_SPACE: u32 = 57;
+const KEY_CAPS: u32 = 58;
+
+/// A key sequence used to cycle XKB layouts: zero or more held modifiers plus a trigger key.
+#[derive(Debug, Clone)]
+struct KeySequence {
+    modifiers: Vec<u32>,
+    trigger: u32,
+}
+
 /// Global tokio runtime for portal connections.
 /// Using a single runtime avoids issues with zbus/DBus connection state
 /// being left in a bad state when a runtime is dropped.
@@ -255,15 +273,18 @@ fn build_key_to_keycode_map() -> HashMap<String, u32> {
 ///
 /// This ensures keys at the requested layout take priority, while layout-independent
 /// keys are still found via fallback.
+/// Returns `(keycode, need_shift, found_layout)`.
+/// `found_layout` may differ from `layout_index` when the character lives in another layout.
 fn find_keycode_for_char(
     ch: char,
     keymap: &xkb::Keymap,
     layout_index: u32,
-) -> Result<(u32, bool), EiTypeError> {
+) -> Result<(u32, bool, u32), EiTypeError> {
     let min_keycode: u32 = keymap.min_keycode().into();
     let max_keycode: u32 = keymap.max_keycode().into();
+    let total_layouts = keymap.num_layouts();
 
-    // Pass 1: search keys that have the requested layout
+    // Pass 1: search the active layout first
     for keycode_raw in min_keycode..=max_keycode {
         let keycode = xkb::Keycode::new(keycode_raw);
         let num_layouts = keymap.num_layouts_for_key(keycode);
@@ -272,7 +293,7 @@ fn find_keycode_for_char(
             if let Some(result) =
                 search_key_for_char(ch, keymap, keycode, keycode_raw, layout_index)
             {
-                return Ok(result);
+                return Ok((result.0, result.1, layout_index));
             }
         }
     }
@@ -285,8 +306,27 @@ fn find_keycode_for_char(
 
             if layout_index >= num_layouts && num_layouts > 0 {
                 if let Some(result) = search_key_for_char(ch, keymap, keycode, keycode_raw, 0) {
-                    return Ok(result);
+                    return Ok((result.0, result.1, 0));
                 }
+            }
+        }
+    }
+
+    // Pass 3: search all other layouts — character requires a layout switch
+    for alt_layout in 0..total_layouts {
+        if alt_layout == layout_index {
+            continue;
+        }
+        for keycode_raw in min_keycode..=max_keycode {
+            let keycode = xkb::Keycode::new(keycode_raw);
+            let num_layouts = keymap.num_layouts_for_key(keycode);
+            let effective = if alt_layout < num_layouts {
+                alt_layout
+            } else {
+                0
+            };
+            if let Some(result) = search_key_for_char(ch, keymap, keycode, keycode_raw, effective) {
+                return Ok((result.0, result.1, alt_layout));
             }
         }
     }
@@ -322,23 +362,27 @@ fn search_key_for_char(
     None
 }
 
-/// Convert an XKB keysym to a character
+/// Convert an XKB keysym to a character.
+/// Delegates to libxkbcommon so all keysym families work, including
+/// legacy Cyrillic (0x06xx), Greek, Hebrew, etc.
 fn keysym_to_char(keysym: u32) -> Option<char> {
-    if (0x20..=0x7e).contains(&keysym) {
-        return char::from_u32(keysym);
+    let cp = xkb::keysym_to_utf32(xkb::Keysym::new(keysym));
+    if cp != 0 {
+        char::from_u32(cp)
+    } else {
+        None
     }
-    if (0xa0..=0xff).contains(&keysym) {
-        return char::from_u32(keysym);
-    }
-    if keysym >= 0x1000000 {
-        return char::from_u32(keysym - 0x1000000);
-    }
-    match keysym {
-        0xff0d => Some('\n'),
-        0xff09 => Some('\t'),
-        0x20 => Some(' '),
-        _ => None,
-    }
+}
+
+/// Count distinct layout names in a keymap.
+/// Some compositors (e.g. Mutter) compile keymaps with a duplicate
+/// trailing group, inflating `num_layouts()` beyond the user-configured count.
+fn count_unique_layouts(keymap: &xkb::Keymap) -> u32 {
+    let n = keymap.num_layouts();
+    (0..n)
+        .map(|i| keymap.layout_get_name(i))
+        .collect::<std::collections::HashSet<_>>()
+        .len() as u32
 }
 
 /// Poll the EI connection for a KeyboardModifiers event to detect the active layout group.
@@ -417,6 +461,91 @@ fn detect_active_layout_index() -> Option<u32> {
     }
 
     None
+}
+
+/// Detect the key sequence used to cycle through XKB layouts.
+/// Reads from GNOME's `switch-input-source` gsetting; falls back to parsing xkb-options.
+fn detect_layout_switch_key() -> Option<KeySequence> {
+    use std::process::Command;
+
+    // Try the explicit GNOME keybinding first: e.g. ['<Super>space', 'XF86Keyboard']
+    if let Ok(out) = Command::new("gsettings")
+        .args([
+            "get",
+            "org.gnome.desktop.wm.keybindings",
+            "switch-input-source",
+        ])
+        .output()
+    {
+        let s = String::from_utf8_lossy(&out.stdout);
+        for entry in s.split('\'') {
+            if let Some(seq) = parse_gtk_accelerator(entry.trim()) {
+                return Some(seq);
+            }
+        }
+    }
+
+    // Fall back to xkb-options: e.g. grp:alt_shift_toggle
+    if let Ok(out) = Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.input-sources", "xkb-options"])
+        .output()
+    {
+        let s = String::from_utf8_lossy(&out.stdout);
+        for token in s.split('\'') {
+            if let Some(seq) = parse_grp_option(token.trim()) {
+                return Some(seq);
+            }
+        }
+    }
+
+    None
+}
+
+/// Parse a GTK accelerator string like `<Super>space` or `<Alt>Shift_L`.
+fn parse_gtk_accelerator(s: &str) -> Option<KeySequence> {
+    let mut modifiers: Vec<u32> = Vec::new();
+    let mut rest = s;
+    while let Some(end) = rest.find('>') {
+        let keycode = match rest[1..end].to_lowercase().as_str() {
+            "super" | "meta" => KEY_SUPER,
+            "alt" => KEY_ALT_L,
+            "ctrl" | "control" => KEY_CTRL_L,
+            "shift" => KEY_SHIFT_L,
+            _ => return None,
+        };
+        modifiers.push(keycode);
+        rest = &rest[end + 1..];
+    }
+    let trigger = match rest.to_lowercase().as_str() {
+        "space" => KEY_SPACE,
+        "shift_l" => KEY_SHIFT_L,
+        "shift_r" => KEY_SHIFT_R,
+        "alt_l" => KEY_ALT_L,
+        "alt_r" => KEY_ALT_R,
+        "ctrl_l" | "control_l" => KEY_CTRL_L,
+        "ctrl_r" | "control_r" => KEY_CTRL_R,
+        _ => return None,
+    };
+    Some(KeySequence { modifiers, trigger })
+}
+
+/// Parse an xkb-option grp: token like `grp:alt_shift_toggle`.
+fn parse_grp_option(s: &str) -> Option<KeySequence> {
+    let seq = |mods: Vec<u32>, trigger| {
+        Some(KeySequence {
+            modifiers: mods,
+            trigger,
+        })
+    };
+    match s {
+        "grp:alt_shift_toggle" => seq(vec![KEY_ALT_L], KEY_SHIFT_L),
+        "grp:ctrl_shift_toggle" => seq(vec![KEY_CTRL_L], KEY_SHIFT_L),
+        "grp:super_space_toggle" => seq(vec![KEY_SUPER], KEY_SPACE),
+        "grp:alt_space_toggle" => seq(vec![KEY_ALT_L], KEY_SPACE),
+        "grp:shifts_toggle" => seq(vec![], KEY_SHIFT_L),
+        "grp:caps_toggle" => seq(vec![], KEY_CAPS),
+        _ => None,
+    }
 }
 
 /// Detect active layout index on GNOME by comparing `mru-sources` against `sources`.
@@ -778,6 +907,8 @@ pub struct EiType {
     held_modifiers: Vec<u32>,
     sequence: u32,
     layout_index: u32,
+    num_layouts: u32,
+    layout_switch_key: Option<KeySequence>,
     /// Track whether close() has been called to avoid double-close
     closed: bool,
 }
@@ -905,6 +1036,16 @@ impl EiType {
             .unwrap_or(0);
         info!("Using layout index: {}", layout_index);
 
+        let layout_switch_key = detect_layout_switch_key();
+        if let Some(ref seq) = layout_switch_key {
+            info!(
+                "Layout switch key detected: mods={:?} trigger={}",
+                seq.modifiers, seq.trigger
+            );
+        } else {
+            warn!("Could not detect layout switch key; cross-layout typing may fail");
+        }
+
         let mut eitype = Self {
             connection,
             device,
@@ -916,6 +1057,8 @@ impl EiType {
             held_modifiers: Vec::new(),
             sequence: 1,
             layout_index,
+            num_layouts: 1,
+            layout_switch_key,
             closed: false,
         };
 
@@ -967,6 +1110,7 @@ impl EiType {
             })?;
 
             let state = xkb::State::new(&keymap);
+            self.num_layouts = count_unique_layouts(&keymap);
             self.keymap = Some(keymap);
             self.xkb_state = Some(state);
             return Ok(());
@@ -998,17 +1142,19 @@ impl EiType {
             let num_layouts = keymap.num_layouts();
             if num_layouts > 0 {
                 let layout_name = keymap.layout_get_name(0);
+                let unique = count_unique_layouts(&keymap);
                 info!(
                     "Keymap loaded from EI server: layout=\"{}\" ({} layout(s) available)",
-                    layout_name, num_layouts
+                    layout_name, unique
                 );
                 for i in 0..num_layouts {
                     debug!("  Layout {}: \"{}\"", i, keymap.layout_get_name(i));
                 }
+                self.num_layouts = unique;
             } else {
                 info!("Keymap loaded from EI server (no layout name available)");
+                self.num_layouts = count_unique_layouts(&keymap);
             }
-
             self.keymap = Some(keymap);
             self.xkb_state = Some(state);
             return Ok(());
@@ -1030,6 +1176,7 @@ impl EiType {
 
         let state = xkb::State::new(&keymap);
 
+        self.num_layouts = count_unique_layouts(&keymap);
         self.keymap = Some(keymap);
         self.xkb_state = Some(state);
         Ok(())
@@ -1133,55 +1280,94 @@ impl EiType {
         Ok(())
     }
 
-    fn type_char(&self, ch: char) -> Result<(), EiTypeError> {
-        trace!("Typing character: {:?}", ch);
-
-        if let Some(keymap) = &self.keymap {
-            let (keycode, need_shift) = find_keycode_for_char(ch, keymap, self.layout_index)?;
-
-            if need_shift {
-                let shift_keycode = self.key_to_keycode.get("shift").copied().unwrap_or(42);
-                self.press_key_internal(shift_keycode)?;
+    /// Emit the layout-cycle key once, advancing to the next layout.
+    fn emit_layout_switch(&self) -> Result<(), EiTypeError> {
+        if let Some(ref seq) = self.layout_switch_key {
+            for &m in &seq.modifiers {
+                self.press_key_internal(m)?;
             }
-
-            self.tap_key_internal(keycode)?;
-
-            if need_shift {
-                let shift_keycode = self.key_to_keycode.get("shift").copied().unwrap_or(42);
-                self.release_key_internal(shift_keycode)?;
+            self.tap_key_internal(seq.trigger)?;
+            for &m in seq.modifiers.iter().rev() {
+                self.release_key_internal(m)?;
             }
-        } else {
-            // Fallback when no keymap: use hardcoded QWERTY map
-            let ch_lower = ch.to_ascii_lowercase();
-            if let Some(&keycode) = self.key_to_keycode.get(&ch_lower.to_string()) {
-                let need_shift = ch.is_ascii_uppercase();
-
-                if need_shift {
-                    let shift_keycode = self.key_to_keycode.get("shift").copied().unwrap_or(42);
-                    self.press_key_internal(shift_keycode)?;
-                }
-
-                self.tap_key_internal(keycode)?;
-
-                if need_shift {
-                    let shift_keycode = self.key_to_keycode.get("shift").copied().unwrap_or(42);
-                    self.release_key_internal(shift_keycode)?;
-                }
-            } else {
-                warn!("Could not find keycode for character: {:?}", ch);
-                return Err(EiTypeError::CharNotFound(ch));
-            }
+            // Small pause so compositor can apply the layout change
+            std::thread::sleep(Duration::from_millis(50));
         }
-
         Ok(())
     }
 
-    /// Type a string of text
+    /// Cycle layouts until `current` becomes `target` (forward cycling, wraps around).
+    fn switch_to_layout(&self, current: u32, target: u32) -> Result<(), EiTypeError> {
+        if current == target || self.num_layouts <= 1 {
+            return Ok(());
+        }
+        let steps = (target + self.num_layouts - current) % self.num_layouts;
+        for _ in 0..steps {
+            self.emit_layout_switch()?;
+        }
+        Ok(())
+    }
+
+    fn type_char_resolved(&self, keycode: u32, need_shift: bool) -> Result<(), EiTypeError> {
+        let shift_keycode = self
+            .key_to_keycode
+            .get("shift")
+            .copied()
+            .unwrap_or(KEY_SHIFT_L);
+        if need_shift {
+            self.press_key_internal(shift_keycode)?;
+        }
+        self.tap_key_internal(keycode)?;
+        if need_shift {
+            self.release_key_internal(shift_keycode)?;
+        }
+        Ok(())
+    }
+
+    /// Type a string of text, switching layouts as needed per character.
     pub fn type_text(&self, text: &str) -> Result<(), EiTypeError> {
         debug!("Typing text: {:?}", text);
-        for ch in text.chars() {
-            self.type_char(ch)?;
+
+        if let Some(keymap) = &self.keymap {
+            let mut current_layout = self.layout_index;
+
+            for ch in text.chars() {
+                let (keycode, need_shift, needed_layout) =
+                    find_keycode_for_char(ch, keymap, current_layout)?;
+
+                if needed_layout != current_layout {
+                    debug!(
+                        "Char {:?} needs layout {}, current is {} — switching",
+                        ch, needed_layout, current_layout
+                    );
+                    self.switch_to_layout(current_layout, needed_layout)?;
+                    current_layout = needed_layout;
+                }
+
+                self.type_char_resolved(keycode, need_shift)?;
+            }
+
+            // Restore original layout
+            if current_layout != self.layout_index {
+                debug!(
+                    "Restoring original layout {} from {}",
+                    self.layout_index, current_layout
+                );
+                self.switch_to_layout(current_layout, self.layout_index)?;
+            }
+        } else {
+            // Fallback when no keymap: use hardcoded QWERTY map
+            for ch in text.chars() {
+                let ch_lower = ch.to_ascii_lowercase();
+                if let Some(&keycode) = self.key_to_keycode.get(&ch_lower.to_string()) {
+                    self.type_char_resolved(keycode, ch.is_ascii_uppercase())?;
+                } else {
+                    warn!("Could not find keycode for character: {:?}", ch);
+                    return Err(EiTypeError::CharNotFound(ch));
+                }
+            }
         }
+
         Ok(())
     }
 
@@ -1581,7 +1767,7 @@ xkb_keymap {
             "Space should be found at layout_index=1, got: {:?}",
             result
         );
-        let (keycode, _need_shift) = result.unwrap();
+        let (keycode, _need_shift, _layout) = result.unwrap();
         // evdev keycode for space is 57 (XKB 65 - 8)
         assert_eq!(keycode, 57, "Space should map to evdev keycode 57");
     }
@@ -1592,7 +1778,7 @@ xkb_keymap {
         // Baseline: space at layout 0 should always work
         let result = find_keycode_for_char(' ', &keymap, 0);
         assert!(result.is_ok(), "Space should be found at layout_index=0");
-        let (keycode, _need_shift) = result.unwrap();
+        let (keycode, _need_shift, _layout) = result.unwrap();
         assert_eq!(keycode, 57);
     }
 
@@ -1687,5 +1873,185 @@ xkb_keymap {
   }
 ]"#;
         assert_eq!(parse_sway_layout_index(json), None);
+    }
+
+    #[test]
+    fn test_keysym_to_char_cyrillic_legacy() {
+        // Legacy Cyrillic keysyms (0x06xx) used by the standard 'ru' XKB layout.
+        // Previously these returned None because they are outside the ASCII/Latin-1/
+        // Unicode-offset ranges handled by the old implementation.
+        assert_eq!(keysym_to_char(0x06f0), Some('П')); // Cyrillic_PE  U+041F
+        assert_eq!(keysym_to_char(0x06d0), Some('п')); // cyrillic_pe  U+043F
+        assert_eq!(keysym_to_char(0x06c6), Some('ф')); // Cyrillic_ef  U+0444
+        assert_eq!(keysym_to_char(0x06e6), Some('Ф')); // Cyrillic_EF  U+0424
+    }
+
+    /// Create a minimal 3-group XKB keymap where group 0 and group 2 share the
+    /// same name. This reproduces the layout count reported by GNOME/Mutter's
+    /// EI server when the user has 2 layouts (e.g. [us, ru]).
+    fn make_three_group_keymap_with_duplicate_last() -> xkb::Keymap {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_DEFAULT_INCLUDES);
+        let keymap_str = r#"
+xkb_keymap {
+    xkb_keycodes "test" {
+        minimum = 8;
+        maximum = 255;
+        <AC01> = 38;
+    };
+    xkb_types "test" {
+        type "TWO_LEVEL" {
+            modifiers = Shift;
+            map[Shift] = Level2;
+            level_name[Level1] = "Base";
+            level_name[Level2] = "Shift";
+        };
+    };
+    xkb_compatibility "test" {
+        interpret Any+AnyOf(all) { action = SetMods(modifiers=modMapMods,clearLocks); };
+    };
+    xkb_symbols "test" {
+        name[group1] = "English (US)";
+        name[group2] = "Russian";
+        name[group3] = "English (US)";
+        key <AC01> {
+            symbols[Group1] = [ a, A ],
+            symbols[Group2] = [ U043F, U041F ],
+            symbols[Group3] = [ a, A ]
+        };
+    };
+};
+"#;
+        xkb::Keymap::new_from_string(
+            &context,
+            keymap_str.to_string(),
+            xkb::KEYMAP_FORMAT_TEXT_V1,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("Failed to create 3-group test keymap")
+    }
+
+    #[test]
+    fn test_count_unique_layouts_deduplicates_trailing_duplicate() {
+        // Confirm the raw XKB count is 3 (the bug as reported by the EI server).
+        let keymap = make_three_group_keymap_with_duplicate_last();
+        assert_eq!(keymap.num_layouts(), 3, "raw XKB group count should be 3");
+        // After deduplication the user-visible count must be 2.
+        assert_eq!(count_unique_layouts(&keymap), 2);
+    }
+
+    #[test]
+    fn test_find_cyrillic_char_in_two_layout_keymap() {
+        // Verify that Cyrillic characters can be found via find_keycode_for_char
+        // in a keymap using Unicode keysyms for the Russian group.
+        // Uses the 3-group keymap; group 1 (0-indexed) is Russian.
+        let keymap = make_three_group_keymap_with_duplicate_last();
+        let result = find_keycode_for_char('п', &keymap, 1);
+        assert!(
+            result.is_ok(),
+            "'п' should be found at layout_index=1, got: {:?}",
+            result
+        );
+        let result_upper = find_keycode_for_char('П', &keymap, 1);
+        assert!(
+            result_upper.is_ok(),
+            "'П' should be found at layout_index=1, got: {:?}",
+            result_upper
+        );
+        let (_, need_shift, _) = result_upper.unwrap();
+        assert!(need_shift, "uppercase П should require Shift");
+    }
+
+    // Pass 3: character lives in a different layout than the active one.
+    // Searching for Cyrillic while layout_index=0 (English) should find it
+    // in layout 1 (Russian) and report found_layout=1.
+    #[test]
+    fn test_find_keycode_cross_layout_returns_alt_layout() {
+        let keymap = make_three_group_keymap_with_duplicate_last();
+        let result = find_keycode_for_char('п', &keymap, 0);
+        assert!(
+            result.is_ok(),
+            "'п' should be found via cross-layout search, got: {:?}",
+            result
+        );
+        let (_, _, found_layout) = result.unwrap();
+        assert_eq!(
+            found_layout, 1,
+            "Cyrillic 'п' should be reported in layout 1 (Russian)"
+        );
+    }
+
+    #[test]
+    fn test_find_keycode_returns_active_layout_index() {
+        let keymap = make_three_group_keymap_with_duplicate_last();
+        // 'a' is in layout 0 (English); searching from layout 0 should return found_layout=0.
+        let (_, _, found_layout) = find_keycode_for_char('a', &keymap, 0).unwrap();
+        assert_eq!(found_layout, 0);
+    }
+
+    #[test]
+    fn test_find_keycode_char_not_found() {
+        let keymap = make_three_group_keymap_with_duplicate_last();
+        // '€' is not in the test keymap at all.
+        let result = find_keycode_for_char('€', &keymap, 0);
+        assert!(matches!(result, Err(EiTypeError::CharNotFound('€'))));
+    }
+
+    #[test]
+    fn test_parse_gtk_accelerator_super_space() {
+        let seq = parse_gtk_accelerator("<Super>space").unwrap();
+        assert_eq!(seq.modifiers, vec![KEY_SUPER]);
+        assert_eq!(seq.trigger, KEY_SPACE);
+    }
+
+    #[test]
+    fn test_parse_gtk_accelerator_alt_shift() {
+        let seq = parse_gtk_accelerator("<Alt>Shift_L").unwrap();
+        assert_eq!(seq.modifiers, vec![KEY_ALT_L]);
+        assert_eq!(seq.trigger, KEY_SHIFT_L);
+    }
+
+    #[test]
+    fn test_parse_gtk_accelerator_unknown_modifier_returns_none() {
+        assert!(parse_gtk_accelerator("<Hyper>space").is_none());
+    }
+
+    #[test]
+    fn test_parse_gtk_accelerator_unknown_trigger_returns_none() {
+        assert!(parse_gtk_accelerator("<Super>XF86Keyboard").is_none());
+    }
+
+    #[test]
+    fn test_parse_grp_option_all_known() {
+        assert_eq!(
+            parse_grp_option("grp:alt_shift_toggle").map(|s| (s.modifiers, s.trigger)),
+            Some((vec![KEY_ALT_L], KEY_SHIFT_L))
+        );
+        assert_eq!(
+            parse_grp_option("grp:super_space_toggle").map(|s| (s.modifiers, s.trigger)),
+            Some((vec![KEY_SUPER], KEY_SPACE))
+        );
+        assert_eq!(
+            parse_grp_option("grp:caps_toggle").map(|s| (s.modifiers, s.trigger)),
+            Some((vec![], KEY_CAPS))
+        );
+    }
+
+    #[test]
+    fn test_parse_grp_option_unknown_returns_none() {
+        assert!(parse_grp_option("grp:unknown_toggle").is_none());
+        assert!(parse_grp_option("").is_none());
+    }
+
+    // switch_to_layout step calculation: (target + num_layouts - current) % num_layouts
+    #[test]
+    fn test_switch_to_layout_steps() {
+        // Verify the modular step formula directly for a 3-layout cycle.
+        let num_layouts: u32 = 3;
+        let steps = |current: u32, target: u32| (target + num_layouts - current) % num_layouts;
+        assert_eq!(steps(0, 1), 1); // forward one
+        assert_eq!(steps(0, 2), 2); // forward two
+        assert_eq!(steps(1, 0), 2); // wrap around (1→2→0 = 2 presses)
+        assert_eq!(steps(2, 0), 1); // wrap around (2→0 = 1 press)
+        assert_eq!(steps(1, 1), 0); // already at target
     }
 }
