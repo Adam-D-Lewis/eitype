@@ -405,20 +405,16 @@ fn mask_to_modifier_keycodes(
 
 /// Convert an XKB keysym to a character
 fn keysym_to_char(keysym: u32) -> Option<char> {
-    if (0x20..=0x7e).contains(&keysym) {
-        return char::from_u32(keysym);
+    // Map XK_Return to '\n' so callers can pass "\n" to press Enter.
+    // xkb_keysym_to_utf32 returns '\r' (U+000D) for this keysym.
+    if keysym == 0xff0d {
+        return Some('\n');
     }
-    if (0xa0..=0xff).contains(&keysym) {
-        return char::from_u32(keysym);
-    }
-    if keysym >= 0x1000000 {
-        return char::from_u32(keysym - 0x1000000);
-    }
-    match keysym {
-        0xff0d => Some('\n'),
-        0xff09 => Some('\t'),
-        0x20 => Some(' '),
-        _ => None,
+    let codepoint = xkb::keysym_to_utf32(xkb::Keysym::new(keysym));
+    if codepoint == 0 {
+        None
+    } else {
+        char::from_u32(codepoint)
     }
 }
 
@@ -1541,6 +1537,31 @@ mod tests {
     #[test]
     fn test_keysym_to_char_unicode() {
         assert_eq!(keysym_to_char(0x1000000 + 0x00e9), Some('é'));
+    }
+
+    #[test]
+    fn test_keysym_to_char_cyrillic() {
+        // Cyrillic_PE / Cyrillic_pe — regression test for issue #8
+        assert_eq!(keysym_to_char(0x06f0), Some('П'));
+        assert_eq!(keysym_to_char(0x06d0), Some('п'));
+    }
+
+    #[test]
+    fn test_keysym_to_char_greek() {
+        // Greek_alpha → α, Greek_ALPHA → Α
+        assert_eq!(keysym_to_char(0x07e1), Some('α'));
+        assert_eq!(keysym_to_char(0x07c1), Some('Α'));
+    }
+
+    #[test]
+    fn test_keysym_to_char_special() {
+        assert_eq!(keysym_to_char(0xff0d), Some('\n')); // XK_Return → '\n'
+        assert_eq!(keysym_to_char(0xff09), Some('\t')); // XK_Tab
+    }
+
+    #[test]
+    fn test_keysym_to_char_unmapped() {
+        assert_eq!(keysym_to_char(0xffe1), None); // XK_Shift_L has no Unicode mapping
     }
 
     #[test]
