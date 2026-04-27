@@ -346,10 +346,15 @@ fn search_key_for_char(
 ///
 /// Masks containing Lock (caps lock), Mod2 (typically NumLock), or Mod3 are
 /// rejected so we never toggle locking state to type a single character.
+///
+/// `keymap_mod_keycodes` maps an xkb real-modifier name (e.g. "Mod5") to the
+/// evdev keycode of a key that produces that modifier *in this specific keymap* —
+/// see `build_keymap_modifier_map`. This is what makes the function correct under
+/// xkb-options like `lv3:ralt_alt` that move ISO_Level3_Shift off Right Alt.
 fn modifier_keycodes_for_match(
     keymap: &xkb::Keymap,
     m: &KeyMatch,
-    key_to_keycode: &HashMap<String, u32>,
+    keymap_mod_keycodes: &HashMap<String, u32>,
 ) -> Vec<u32> {
     if m.level == 0 {
         return Vec::new();
@@ -365,7 +370,7 @@ fn modifier_keycodes_for_match(
     // Among acceptable masks, prefer the one with the fewest modifier keys.
     let mut best: Option<Vec<u32>> = None;
     for &mask in &masks[..n] {
-        if let Some(keycodes) = mask_to_modifier_keycodes(mask, keymap, key_to_keycode) {
+        if let Some(keycodes) = mask_to_modifier_keycodes(mask, keymap, keymap_mod_keycodes) {
             match &best {
                 Some(b) if b.len() <= keycodes.len() => {}
                 _ => best = Some(keycodes),
@@ -378,10 +383,14 @@ fn modifier_keycodes_for_match(
 /// Convert one xkb modifier mask into the list of evdev keycodes we'd press to
 /// produce it. Returns `None` if the mask contains a modifier we don't support
 /// (Lock, Mod2, Mod3, or any unmapped name) so the caller can try a different mask.
+///
+/// Looks up keycodes via `keymap_mod_keycodes`, which was built from this exact
+/// keymap, so e.g. with `lv3:ralt_alt` set we'll resolve Mod5 to the Menu key
+/// rather than the hardcoded Right Alt.
 fn mask_to_modifier_keycodes(
     mask: xkb::ModMask,
     keymap: &xkb::Keymap,
-    key_to_keycode: &HashMap<String, u32>,
+    keymap_mod_keycodes: &HashMap<String, u32>,
 ) -> Option<Vec<u32>> {
     let num_mods = keymap.num_mods();
     let mut keycodes = Vec::new();
@@ -389,18 +398,90 @@ fn mask_to_modifier_keycodes(
         if mask & (1 << idx) == 0 {
             continue;
         }
-        let key_name = match keymap.mod_get_name(idx) {
-            "Shift" => "shift",
-            "Control" => "ctrl",
-            "Mod1" => "alt",
-            "Mod4" => "super",
-            "Mod5" => "altgr",
+        let mod_name = keymap.mod_get_name(idx);
+        match mod_name {
+            "Shift" | "Control" | "Mod1" | "Mod4" | "Mod5" => {}
             _ => return None,
-        };
-        let kc = key_to_keycode.get(key_name).copied()?;
+        }
+        let kc = keymap_mod_keycodes.get(mod_name).copied()?;
         keycodes.push(kc);
     }
     Some(keycodes)
+}
+
+/// Find the evdev keycode of a key that, when pressed, produces the given
+/// real-modifier index in this keymap.
+///
+/// Walks the keycode range and uses `xkb_state` to simulate a press, then checks
+/// whether the requested modifier bit became active. This honors the keymap's
+/// modmap (including remappings from xkb-options), so the result is always valid
+/// for the actual keymap in use — not a hardcoded assumption like "AltGr is RAlt".
+///
+/// Two heuristics are needed to pick the *right* keycode when several produce
+/// the same modifier:
+///
+/// 1. xkb's standard `evdev` keycodes file aliases low-numbered phantom keycodes
+///    (e.g. evdev 84 for ISO_Level3_Shift) alongside the real physical keys
+///    (e.g. RAlt=100, Menu=127). The phantoms share the modifier-keysym name but
+///    aren't reachable on physical hardware, so we group hits by their level-0
+///    keysym name and keep only the highest keycode per group — that filters
+///    phantoms.
+/// 2. Among distinct physical modifier keys (e.g. `Shift_L`=42 vs `Shift_R`=54),
+///    we pick the lowest keycode — Left variants are conventionally lower-numbered
+///    and are the more common choice for synthesized input.
+fn find_keycode_for_modifier(keymap: &xkb::Keymap, mod_idx: xkb::ModIndex) -> Option<u32> {
+    if mod_idx == xkb::MOD_INVALID {
+        return None;
+    }
+    let target_bit = 1u32 << mod_idx;
+    let min: u32 = keymap.min_keycode().into();
+    let max: u32 = keymap.max_keycode().into();
+
+    // Per keysym name, track the highest keycode that produces this modifier.
+    // Highest wins because xkb's phantom aliases are low-numbered.
+    let mut by_keysym: HashMap<String, u32> = HashMap::new();
+    for kc_raw in min..=max {
+        let kc = xkb::Keycode::new(kc_raw);
+        let mut state = xkb::State::new(keymap);
+        state.update_key(kc, xkb::KeyDirection::Down);
+        let mods = state.serialize_mods(xkb::STATE_MODS_DEPRESSED);
+        if mods & target_bit == 0 {
+            continue;
+        }
+        let level0_syms = keymap.key_get_syms_by_level(kc, 0, 0);
+        let sym_name = level0_syms
+            .first()
+            .map(|s| xkb::keysym_get_name(*s))
+            .unwrap_or_default();
+        let evdev = kc_raw - 8;
+        by_keysym
+            .entry(sym_name)
+            .and_modify(|e| {
+                if evdev > *e {
+                    *e = evdev;
+                }
+            })
+            .or_insert(evdev);
+    }
+
+    // Lowest among distinct physical keys → typically the Left variant.
+    by_keysym.values().copied().min()
+}
+
+/// Resolve the set of real modifiers we care about (Shift, Control, Mod1, Mod4,
+/// Mod5) to evdev keycodes for *this specific keymap*.
+///
+/// Modifiers that aren't bound to any key in the keymap are simply omitted —
+/// `mask_to_modifier_keycodes` will then reject any mask requiring them.
+fn build_keymap_modifier_map(keymap: &xkb::Keymap) -> HashMap<String, u32> {
+    let mut map = HashMap::new();
+    for name in ["Shift", "Control", "Mod1", "Mod4", "Mod5"] {
+        let idx = keymap.mod_get_index(name);
+        if let Some(kc) = find_keycode_for_modifier(keymap, idx) {
+            map.insert(name.to_string(), kc);
+        }
+    }
+    map
 }
 
 /// Convert an XKB keysym to a character
@@ -851,6 +932,9 @@ pub struct EiType {
     keymap: Option<xkb::Keymap>,
     xkb_state: Option<xkb::State>,
     key_to_keycode: HashMap<String, u32>,
+    /// Real-modifier name (e.g. "Mod5") -> evdev keycode that produces it,
+    /// derived from the active keymap's modmap. Populated by `install_keymap`.
+    keymap_mod_keycodes: HashMap<String, u32>,
     delay: Duration,
     held_modifiers: Vec<u32>,
     sequence: u32,
@@ -989,6 +1073,7 @@ impl EiType {
             keymap: None,
             xkb_state: None,
             key_to_keycode: build_key_to_keycode_map(),
+            keymap_mod_keycodes: HashMap::new(),
             delay: Duration::from_millis(config.delay_ms),
             held_modifiers: Vec::new(),
             sequence: 1,
@@ -1003,6 +1088,18 @@ impl EiType {
         eitype.start_emulating()?;
 
         Ok(eitype)
+    }
+
+    /// Install a freshly-loaded keymap and recompute the modifier-keycode lookup.
+    /// Centralizes the bookkeeping so every load path stays in sync.
+    fn install_keymap(&mut self, keymap: xkb::Keymap, state: xkb::State) {
+        self.keymap_mod_keycodes = build_keymap_modifier_map(&keymap);
+        debug!(
+            "Resolved modifier keycodes from keymap: {:?}",
+            self.keymap_mod_keycodes
+        );
+        self.keymap = Some(keymap);
+        self.xkb_state = Some(state);
     }
 
     fn setup_keymap(&mut self, config: &EiTypeConfig) -> Result<(), EiTypeError> {
@@ -1044,8 +1141,7 @@ impl EiType {
             })?;
 
             let state = xkb::State::new(&keymap);
-            self.keymap = Some(keymap);
-            self.xkb_state = Some(state);
+            self.install_keymap(keymap, state);
             return Ok(());
         }
 
@@ -1086,8 +1182,7 @@ impl EiType {
                 info!("Keymap loaded from EI server (no layout name available)");
             }
 
-            self.keymap = Some(keymap);
-            self.xkb_state = Some(state);
+            self.install_keymap(keymap, state);
             return Ok(());
         }
 
@@ -1107,8 +1202,7 @@ impl EiType {
 
         let state = xkb::State::new(&keymap);
 
-        self.keymap = Some(keymap);
-        self.xkb_state = Some(state);
+        self.install_keymap(keymap, state);
         Ok(())
     }
 
@@ -1216,7 +1310,7 @@ impl EiType {
         if let Some(keymap) = &self.keymap {
             let key_match = find_keycode_for_char(ch, keymap, self.layout_index)?;
             let mod_keycodes =
-                modifier_keycodes_for_match(keymap, &key_match, &self.key_to_keycode);
+                modifier_keycodes_for_match(keymap, &key_match, &self.keymap_mod_keycodes);
 
             for &mkc in &mod_keycodes {
                 self.press_key_internal(mkc)?;
@@ -1739,10 +1833,10 @@ xkb_keymap {
 
     #[test]
     fn test_modifier_keycodes_for_match_altgr_level2() {
-        // Level 2 -> AltGr (evdev 100).
+        // Level 2 -> AltGr. Default us-intl modmap binds Mod5 to RAlt (evdev 100).
         let keymap = system_keymap("us", "intl");
         let m = find_keycode_for_char('ä', &keymap, 0).unwrap();
-        let mods = modifier_keycodes_for_match(&keymap, &m, &build_key_to_keycode_map());
+        let mods = modifier_keycodes_for_match(&keymap, &m, &build_keymap_modifier_map(&keymap));
         assert_eq!(mods, vec![100], "ä on us-intl needs AltGr (evdev 100)");
     }
 
@@ -1752,7 +1846,7 @@ xkb_keymap {
         let keymap = system_keymap("us", "intl");
         let m = find_keycode_for_char('Ä', &keymap, 0).unwrap();
         assert_eq!(m.level, 3, "Ä is at level 3 (AltGr+Shift) on us-intl");
-        let mods = modifier_keycodes_for_match(&keymap, &m, &build_key_to_keycode_map());
+        let mods = modifier_keycodes_for_match(&keymap, &m, &build_keymap_modifier_map(&keymap));
         // Order isn't fixed; just assert set membership and count.
         assert_eq!(mods.len(), 2);
         assert!(mods.contains(&42), "Ä needs Shift (evdev 42)");
@@ -1763,7 +1857,7 @@ xkb_keymap {
     fn test_modifier_keycodes_for_match_level0_no_mods() {
         let keymap = system_keymap("us", "");
         let m = find_keycode_for_char('a', &keymap, 0).unwrap();
-        let mods = modifier_keycodes_for_match(&keymap, &m, &build_key_to_keycode_map());
+        let mods = modifier_keycodes_for_match(&keymap, &m, &build_keymap_modifier_map(&keymap));
         assert!(mods.is_empty(), "level 0 needs no modifiers");
     }
 
@@ -1771,8 +1865,50 @@ xkb_keymap {
     fn test_modifier_keycodes_for_match_level1_shift() {
         let keymap = system_keymap("us", "");
         let m = find_keycode_for_char('A', &keymap, 0).unwrap();
-        let mods = modifier_keycodes_for_match(&keymap, &m, &build_key_to_keycode_map());
+        let mods = modifier_keycodes_for_match(&keymap, &m, &build_keymap_modifier_map(&keymap));
         assert_eq!(mods, vec![42], "level 1 needs Shift only");
+    }
+
+    #[test]
+    fn test_keymap_modifier_map_default_us_intl() {
+        // Sanity: on the default us-intl modmap, the canonical bindings hold.
+        let keymap = system_keymap("us", "intl");
+        let map = build_keymap_modifier_map(&keymap);
+        assert_eq!(map.get("Shift").copied(), Some(42), "Shift -> LShift");
+        assert_eq!(map.get("Mod5").copied(), Some(100), "Mod5 -> RAlt (AltGr)");
+    }
+
+    #[test]
+    fn test_keymap_modifier_map_honors_lv3_ralt_alt() {
+        // Regression: with `lv3:ralt_alt`, RAlt is Alt (Mod1), not AltGr (Mod5).
+        // The Menu key (evdev 127) should pick up Mod5 via `lv3:menu_switch`.
+        // This is the configuration that broke PR #16's hardcoded AltGr=100.
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let keymap = xkb::Keymap::new_from_names(
+            &context,
+            "",
+            "",
+            "us",
+            "intl",
+            Some("lv3:ralt_alt,lv3:menu_switch".to_string()),
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("system xkb data required (install xkeyboard-config)");
+        let map = build_keymap_modifier_map(&keymap);
+        assert_eq!(
+            map.get("Mod5").copied(),
+            Some(127),
+            "with lv3:menu_switch, Mod5 should resolve to the Menu key (evdev 127), \
+             not the hardcoded RAlt=100"
+        );
+        // RAlt is now Mod1 under lv3:ralt_alt — Mod1 should resolve to it (or LAlt;
+        // either is fine, both produce Mod1).
+        let mod1 = map.get("Mod1").copied();
+        assert!(
+            mod1 == Some(56) || mod1 == Some(100),
+            "Mod1 should be LAlt (56) or RAlt (100); got {:?}",
+            mod1
+        );
     }
 
     #[test]
