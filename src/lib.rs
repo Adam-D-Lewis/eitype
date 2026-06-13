@@ -1366,11 +1366,8 @@ impl EiType {
             match &ks.keymap {
                 Some(keymap) => {
                     let key_match = find_keycode_for_char(ch, keymap, self.layout_index)?;
-                    let mod_keycodes = modifier_keycodes_for_match(
-                        keymap,
-                        &key_match,
-                        &self.keymap_mod_keycodes,
-                    );
+                    let mod_keycodes =
+                        modifier_keycodes_for_match(keymap, &key_match, &self.keymap_mod_keycodes);
                     Some((key_match.evdev_keycode, mod_keycodes))
                 }
                 None => None,
