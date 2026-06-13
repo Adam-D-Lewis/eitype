@@ -241,6 +241,18 @@ typer, _ = EiType.connect_portal_with_token(saved_token)
 typer.type_text("No dialog this time!")
 ```
 
+## Thread Safety
+
+`EiType` is `Send` but not `Sync`. You can **move** an instance between threads —
+for example, create it on one thread and call it from a thread pool — but you must
+**not** call its methods from two threads concurrently.
+
+- **From Python**, this is automatic on standard CPython: the GIL serializes every
+  call. On a free-threaded (no-GIL) interpreter the GIL no longer protects you, so
+  wrap the instance in your own lock if more than one thread can reach it.
+- **From Rust**, serialize access yourself (e.g. behind a `Mutex`) when sharing an
+  instance across threads.
+
 ## Rust Library Usage
 
 Add to your `Cargo.toml`:

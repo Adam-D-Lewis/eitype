@@ -18,6 +18,18 @@
 //! // Press special keys
 //! typer.press_key("Return").unwrap();
 //! ```
+//!
+//! # Thread safety
+//!
+//! [`EiType`] is [`Send`] **and** [`Sync`]: it is safe to create it on one thread
+//! and use it from another (for example, a worker in a thread pool). Access to the
+//! underlying xkbcommon objects is serialized with an internal lock, so sharing an
+//! instance across threads is memory-safe and works the same on GIL-enabled and
+//! free-threaded interpreters.
+//!
+//! Note that the keystroke *stream* is not transactional: if two threads type on the
+//! same instance simultaneously their key events will interleave. Serialize at a
+//! higher level if you need coherent output.
 
 use log::{debug, error, info, trace, warn};
 use reis::ei::{self, handshake::ContextType, keyboard::KeyState};
@@ -25,7 +37,7 @@ use reis::event::{DeviceCapability, EiEvent};
 use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use xkbcommon::xkb;
@@ -923,14 +935,22 @@ fn connect_via_socket(path: &Path) -> Result<UnixStream, EiTypeError> {
 // Main EiType Struct
 // ============================================================================
 
-/// Main interface for typing text via EI protocol
-#[cfg_attr(feature = "python", pyclass(unsendable))]
+/// Main interface for typing text via EI protocol.
+///
+/// # Thread safety
+///
+/// `EiType` is `Send + Sync`: safe to create on one thread and use from another
+/// (e.g. a thread pool). The non-thread-safe xkbcommon objects are held behind an
+/// internal lock, so access is serialized automatically. See the crate-level docs
+/// for the one caveat (concurrent typing interleaves keystrokes).
+#[cfg_attr(feature = "python", pyclass)]
 pub struct EiType {
     connection: reis::event::Connection,
     device: reis::event::Device,
     keyboard: ei::Keyboard,
-    keymap: Option<xkb::Keymap>,
-    xkb_state: Option<xkb::State>,
+    /// xkb keymap + state, behind a lock so `EiType` can be `Send + Sync`
+    /// despite xkbcommon's non-atomic refcounting. See [`KeymapState`].
+    keymap: Mutex<KeymapState>,
     key_to_keycode: HashMap<String, u32>,
     /// Real-modifier name (e.g. "Mod5") -> evdev keycode that produces it,
     /// derived from the active keymap's modmap. Populated by `install_keymap`.
@@ -942,6 +962,37 @@ pub struct EiType {
     /// Track whether close() has been called to avoid double-close
     closed: bool,
 }
+
+/// The xkb keymap and state, which wrap xkbcommon C objects.
+///
+/// These are stored together behind an `EiType`-owned `Mutex` so that the rest of
+/// `EiType` can be `Send + Sync`. xkbcommon uses non-atomic reference counting, so
+/// the objects are not thread-safe on their own; keeping every access behind the
+/// lock guarantees they are never touched from two threads at once.
+#[derive(Default)]
+struct KeymapState {
+    keymap: Option<xkb::Keymap>,
+    xkb_state: Option<xkb::State>,
+}
+
+// SAFETY: `KeymapState` holds `xkb::Keymap`/`xkb::State`, which are `!Send` because
+// xkbcommon refcounts its C objects non-atomically. They are only ever reached
+// through `EiType::keymap` (a `Mutex`), so all access — including the final `Drop`
+// of these objects — is serialized and never concurrent. Under that invariant it is
+// sound to move them between threads, which is what `Send` asserts. We do not need
+// (or claim) `Sync` for `KeymapState`: `Mutex<KeymapState>` is `Sync` purely from
+// `KeymapState: Send`, and the lock is what provides the actual synchronization.
+unsafe impl Send for KeymapState {}
+
+// Compile-time guarantee that `EiType` is `Send + Sync`. PyO3 requires a (non-
+// `unsendable`) `#[pyclass]` to be `Send + Sync`; this is what lets the typer be
+// handed to a different thread (e.g. a `ThreadPoolExecutor` worker) instead of
+// panicking with "unsendable, but sent to another thread". If a future field
+// reintroduces `!Send`/`!Sync`-ness, this assertion fails to build.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<EiType>();
+};
 
 impl EiType {
     /// Connect via the XDG RemoteDesktop portal (simple version, no token management)
@@ -1070,8 +1121,7 @@ impl EiType {
             connection,
             device,
             keyboard,
-            keymap: None,
-            xkb_state: None,
+            keymap: Mutex::new(KeymapState::default()),
             key_to_keycode: build_key_to_keycode_map(),
             keymap_mod_keycodes: HashMap::new(),
             delay: Duration::from_millis(config.delay_ms),
@@ -1098,8 +1148,9 @@ impl EiType {
             "Resolved modifier keycodes from keymap: {:?}",
             self.keymap_mod_keycodes
         );
-        self.keymap = Some(keymap);
-        self.xkb_state = Some(state);
+        let ks = self.keymap.get_mut().unwrap_or_else(|e| e.into_inner());
+        ks.keymap = Some(keymap);
+        ks.xkb_state = Some(state);
     }
 
     fn setup_keymap(&mut self, config: &EiTypeConfig) -> Result<(), EiTypeError> {
@@ -1307,16 +1358,31 @@ impl EiType {
     fn type_char(&self, ch: char) -> Result<(), EiTypeError> {
         trace!("Typing character: {:?}", ch);
 
-        if let Some(keymap) = &self.keymap {
-            let key_match = find_keycode_for_char(ch, keymap, self.layout_index)?;
-            let mod_keycodes =
-                modifier_keycodes_for_match(keymap, &key_match, &self.keymap_mod_keycodes);
+        // Resolve the character to keycodes while holding the keymap lock, then
+        // release it before emitting any events — the press/release path never
+        // needs the keymap, so the lock scope stays as small as possible.
+        let resolved = {
+            let ks = self.keymap.lock().unwrap_or_else(|e| e.into_inner());
+            match &ks.keymap {
+                Some(keymap) => {
+                    let key_match = find_keycode_for_char(ch, keymap, self.layout_index)?;
+                    let mod_keycodes = modifier_keycodes_for_match(
+                        keymap,
+                        &key_match,
+                        &self.keymap_mod_keycodes,
+                    );
+                    Some((key_match.evdev_keycode, mod_keycodes))
+                }
+                None => None,
+            }
+        };
 
+        if let Some((evdev_keycode, mod_keycodes)) = resolved {
             for &mkc in &mod_keycodes {
                 self.press_key_internal(mkc)?;
             }
 
-            self.tap_key_internal(key_match.evdev_keycode)?;
+            self.tap_key_internal(evdev_keycode)?;
 
             for &mkc in mod_keycodes.iter().rev() {
                 self.release_key_internal(mkc)?;

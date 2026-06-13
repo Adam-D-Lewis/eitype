@@ -118,6 +118,13 @@ class EiType:
         >>> typer = EiType.connect_portal()
         >>> typer.type_text("Hello!")
         >>> typer.close()  # Important: call close() before reconnecting
+
+    Thread safety:
+        An ``EiType`` instance may be used from a different thread than the one
+        that created it (e.g. a worker in a ``ThreadPoolExecutor``), but you must
+        not call its methods from two threads at the same time. On a standard
+        CPython interpreter the GIL serializes calls for you; on a free-threaded
+        (no-GIL) build, guard the instance with your own lock.
     """
 
     @staticmethod
